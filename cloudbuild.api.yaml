@@ -1,0 +1,73 @@
+# Builds the Dockerfile, pushes it to Artifact Registry and deploys the API to Cloud Run.
+#
+#   gcloud builds submit --config cloudbuild.api.yaml --project=<project-id> .
+#
+# $PROJECT_ID is provided by Cloud Build. Override any `_` substitution with
+#   --substitutions=_TAG=v1.5.2,_REGION=europe-west1
+# _ALLOWED_ORIGINS takes one origin. For several, use gcloud's custom-delimiter
+# syntax in --set-env-vars (see `gcloud topic escaping`).
+
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -f
+      - Dockerfile
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${_TAG}
+      - .
+
+  # Push the image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${_TAG}
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${_TAG}
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      - --allow-unauthenticated
+      - --port
+      - '3000'
+      - --memory
+      - 2Gi
+      - --cpu
+      - '2'
+      - --max-instances
+      - '10'
+      - --min-instances
+      - '0'
+      - --concurrency
+      - '80'
+      - --timeout
+      - '300'
+      - --set-env-vars
+      - NODE_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,INSIGHTS_PROVIDER=groq,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}
+      - --set-secrets
+      - ${_SECRETS}
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${_TAG}
+
+substitutions:
+  _TAG: latest
+  _REGION: us-central1
+  _REPO: coursecorrect
+  _IMAGE: cc-backend
+  _SERVICE: cc-backend-v1-5
+  _ALLOWED_ORIGINS: https://coursecorrect.fyi
+  # ENV_VAR=secret-name:version pairs from Secret Manager (see docs/deployment-gcp.md)
+  _SECRETS: DATABASE_URL=database-url:latest,JWT_SECRET=jwt-secret:latest,GEMINI_API_KEY=gemini-api-key:latest,GROQ_API_KEY=groq-api-key:latest
+
+options:
+  machineType: 'E2_HIGHCPU_8'

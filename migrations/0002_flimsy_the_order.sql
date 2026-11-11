@@ -1,0 +1,1 @@
+ALTER TABLE "learning_resources" ADD COLUMN "is_self_paced" boolean;
