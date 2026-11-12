@@ -15,10 +15,11 @@ import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { verify } from 'hono/jwt'
 import { GoogleGenAI } from '@google/genai'
-import { and, eq, inArray, sql } from 'drizzle-orm'
+import { and, eq, gt, sql } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { learning_resources, chat_usage } from '../db/schema.js'
 import { retrieveForQuery } from './rag.js'
+import { matchResourceIds } from './resource-ids.js'
 
 export const chatRouter = new Hono()
 
@@ -37,37 +38,22 @@ const ai = new GoogleGenAI({
 
 // ─── Usage limit enforcement (M8.3) ──────────────────────────────────────────
 //
-// Check-then-increment: we read the current count before deciding to allow the
-// request. The counter is only incremented when the request is actually served.
-// Denied requests leave no trace in the DB.
+// Hold, then release: a question is counted when it arrives and given back
+// (refundUsage) if Gemini fails before sending any text. Requests over the
+// limit are rejected and leave no trace in the DB.
 //
-// Race condition: two concurrent requests could both read count=N below the
-// limit and both increment. Acceptable at current scale — Redis INCR would
-// resolve this atomically if needed later.
+// Checking the limit and counting the question is ONE atomic statement: the
+// upsert only increments while count < limit, and Postgres locks the row while
+// it does so. Simultaneous requests therefore queue up and can't slip past the
+// limit (a separate SELECT-then-INSERT let 9 of 10 simultaneous requests
+// through an anonymous limit of 5).
 
 async function checkAndIncrementUsage(
   identity: string,
   identityType: 'user' | 'anon',
   limit: number,
-): Promise<{ allowed: boolean; remaining: number }> {
-  const rows = await db
-    .select({ count: chat_usage.count })
-    .from(chat_usage)
-    .where(
-      and(
-        eq(chat_usage.identity, identity),
-        eq(chat_usage.query_date, sql`CURRENT_DATE`),
-      ),
-    )
-    .limit(1)
-
-  const currentCount = rows[0]?.count ?? 0
-
-  if (currentCount >= limit) {
-    return { allowed: false, remaining: 0 }
-  }
-
-  await db
+): Promise<{ allowed: false; remaining: 0 } | { allowed: true; remaining: number; queryDate: string }> {
+  const [counted] = await db
     .insert(chat_usage)
     .values({
       identity,
@@ -78,9 +64,35 @@ async function checkAndIncrementUsage(
     .onConflictDoUpdate({
       target: [chat_usage.identity, chat_usage.query_date],
       set: { count: sql`${chat_usage.count} + 1` },
+      // Only count the question while under the limit. When this is false,
+      // nothing is updated and no row comes back.
+      setWhere: sql`${chat_usage.count} < ${limit}`,
     })
+    .returning({ count: chat_usage.count, queryDate: chat_usage.query_date })
 
-  return { allowed: true, remaining: limit - currentCount - 1 }
+  if (!counted) {
+    return { allowed: false, remaining: 0 }
+  }
+
+  return { allowed: true, remaining: limit - counted.count, queryDate: counted.queryDate }
+}
+
+/**
+ * Gives back a question that was counted but never answered (Gemini failed
+ * before sending any text). Uses the date the question was counted against,
+ * so a failure just after midnight doesn't take one off the new day.
+ */
+async function refundUsage(identity: string, queryDate: string): Promise<void> {
+  await db
+    .update(chat_usage)
+    .set({ count: sql`${chat_usage.count} - 1` })
+    .where(
+      and(
+        eq(chat_usage.identity, identity),
+        eq(chat_usage.query_date, queryDate),
+        gt(chat_usage.count, 0),
+      ),
+    )
 }
 
 // ─── Identity resolution ──────────────────────────────────────────────────────
@@ -262,7 +274,8 @@ chatRouter.post('/', async (c) => {
     return c.json({ error: 'message is required' }, 400)
   }
 
-  // Accept both `pageContextIds` (new) and `courseIds` (legacy frontend) during transition
+  // Accept both `pageContextIds` (new) and `courseIds` (legacy frontend) during transition.
+  // Each id may be a UUID or a legacy MongoDB ID (see matchResourceIds).
   const rawIds = body['pageContextIds'] ?? body['courseIds']
   const pageContextIds: string[] = Array.isArray(rawIds)
     ? rawIds.filter((id): id is string => typeof id === 'string')
@@ -327,7 +340,8 @@ chatRouter.post('/', async (c) => {
     } | null
   }> = []
 
-  if (pageContextIds.length > 0) {
+  const pageContextMatch = matchResourceIds(pageContextIds)
+  if (pageContextMatch) {
     pageContextResources = await db
       .select({
         id:              learning_resources.id,
@@ -348,12 +362,7 @@ chatRouter.post('/', async (c) => {
         ai_insights:     learning_resources.ai_insights,
       })
       .from(learning_resources)
-      .where(
-        and(
-          eq(learning_resources.is_active, true),
-          inArray(learning_resources.id, pageContextIds),
-        ),
-      )
+      .where(and(eq(learning_resources.is_active, true), pageContextMatch))
   }
 
   // ── 4. RAG retrieval — top-k from catalogue, excluding page context ──────
@@ -371,7 +380,8 @@ chatRouter.post('/', async (c) => {
 
   let ragResources: Awaited<ReturnType<typeof retrieveForQuery>> = []
   try {
-    ragResources = await retrieveForQuery(ragQuery, RAG_K, pageContextIds)
+    // Exclude by resolved UUID: page context may have used legacy ids
+    ragResources = await retrieveForQuery(ragQuery, RAG_K, pageContextResources.map(r => r.id))
   } catch (err) {
     // Non-fatal: fall back to page-context-only if embedding fails
     console.error('[chat] RAG retrieval failed, continuing without catalogue context:', err)
@@ -381,7 +391,13 @@ chatRouter.post('/', async (c) => {
 
   const systemPrompt = buildSystemPrompt(currentPage, searchTerm, pageContextResources, ragResources)
 
+  const { queryDate } = usage
+
   return streamSSE(c, async (stream) => {
+    // Whether any answer text reached the user. If Gemini fails before that,
+    // the question is given back (refundUsage) so outages don't use up the
+    // daily limit. A partial answer still counts.
+    let answered = false
     try {
       // Build multi-turn contents: prior history + current user message.
       // Gemini uses 'user' and 'model' roles — 'bot' maps to 'model'.
@@ -409,12 +425,18 @@ chatRouter.post('/', async (c) => {
           await stream.writeSSE({
             data: JSON.stringify({ type: 'delta', content: text }),
           })
+          answered = true
         }
       }
 
       await stream.writeSSE({ data: JSON.stringify({ type: 'done' }) })
     } catch (err) {
       console.error('[chat] Gemini streaming error:', err)
+      if (!answered) {
+        await refundUsage(identity, queryDate).catch((refundErr: unknown) => {
+          console.error('[chat] failed to refund unanswered question:', refundErr)
+        })
+      }
       await stream.writeSSE({
         data: JSON.stringify({ type: 'error', message: 'Something went wrong. Please try again.' }),
       })

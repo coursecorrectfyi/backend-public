@@ -3,6 +3,7 @@ import { sql, and, eq, inArray, desc, asc } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { learning_resources } from '../db/schema.js'
 import { embedQuery } from '../lib/embedding/vertex.js'
+import { matchResourceId } from './resource-ids.js'
 
 export const resourcesRouter = new Hono()
 
@@ -146,7 +147,8 @@ resourcesRouter.get('/search', async (c) => {
     return c.json({ error: 'Missing required query parameter: q' }, 400)
   }
 
-  const limit      = Math.min(50, Math.max(1, parseInt(c.req.query('limit') ?? '20', 10)))
+  const parsedLimit = parseInt(c.req.query('limit') ?? '', 10)
+  const limit      = Number.isNaN(parsedLimit) ? 20 : Math.min(50, Math.max(1, parsedLimit))
   const cursorToken = c.req.query('cursor') ?? null
   const sort       = (c.req.query('sort') ?? 'relevance') as SortKey
 
@@ -237,10 +239,15 @@ resourcesRouter.get('/search', async (c) => {
 
 // ─── Resource detail ──────────────────────────────────────────────────────────
 //
-// :id accepts either a UUID or a legacy MongoDB ID
+// :id accepts either a UUID or a legacy MongoDB ID (TODO(legacy-mongo-ids))
 
 resourcesRouter.get('/:id', async (c) => {
   const id = c.req.param('id')
+  const match = matchResourceId(id)
+
+  if (!match) {
+    return c.json({ error: 'Not found' }, 404)
+  }
 
   const row = await db
     .select({
@@ -271,15 +278,7 @@ resourcesRouter.get('/:id', async (c) => {
       is_active:       learning_resources.is_active,
     })
     .from(learning_resources)
-    .where(
-      // A UUID is 36 chars with dashes; a MongoDB ObjectId is 24 hex chars.
-      // Passing a non-UUID string to eq(id, ...) causes Postgres to throw
-      // "invalid input syntax for type uuid" before the OR is evaluated.
-      // Use a single precise condition based on the ID format to avoid this.
-      /^[0-9a-f]{24}$/i.test(id)
-        ? eq(learning_resources.legacy_mongo_id, id)
-        : eq(learning_resources.id, id),
-    )
+    .where(match)
     .limit(1)
 
   if (row.length === 0 || !row[0].is_active) {

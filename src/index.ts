@@ -17,7 +17,8 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   : ['http://localhost:3001']
 
 app.use('*', cors({
-  origin: (origin) => allowedOrigins.includes(origin) ? origin : allowedOrigins[0],
+  // Unknown origins get no Access-Control-Allow-Origin header, so the browser blocks them.
+  origin: (origin) => allowedOrigins.includes(origin) ? origin : null,
   allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Session-ID'],
   maxAge: 86400,
@@ -28,8 +29,9 @@ app.get('/health', async (c) => {
     await db.execute(sql`SELECT 1`)
     return c.json({ status: 'ok' })
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    return c.json({ status: 'error', message }, 503)
+    // Log the details; don't send them (hosts, usernames) from a public endpoint.
+    console.error('[health] database check failed:', err)
+    return c.json({ status: 'error', message: 'Database unavailable' }, 503)
   }
 })
 

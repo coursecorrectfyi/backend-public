@@ -1,8 +1,9 @@
 import { Hono } from 'hono'
-import { and, eq } from 'drizzle-orm'
+import { and, desc, eq, inArray } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { saved_courses, learning_resources } from '../db/schema.js'
 import { requireAuth } from './middleware/auth.js'
+import { matchResourceId } from './resource-ids.js'
 
 export const savedRouter = new Hono()
 
@@ -48,7 +49,9 @@ savedRouter.get('/', async (c) => {
       ),
     )
     .where(eq(saved_courses.user_id, userId))
-    .orderBy(saved_courses.saved_at)
+    // Newest first. This used to be oldest first; see "Frontend: saved courses
+    // order" under To do in README.md.
+    .orderBy(desc(saved_courses.saved_at))
 
   const data = rows.map(({ source_url, affiliate_url, ...rest }) => ({
     ...rest,
@@ -61,31 +64,32 @@ savedRouter.get('/', async (c) => {
 // ─── POST /api/v1/saved/:resourceId ──────────────────────────────────────────
 // Saves a resource for the authenticated user.
 // Idempotent — saving an already-saved resource returns 200, not an error.
+// :resourceId may be a UUID or a legacy MongoDB ID (TODO(legacy-mongo-ids));
+// the resource's UUID is what gets stored.
 
 savedRouter.post('/:resourceId', async (c) => {
   const userId = c.var.userId
-  const resourceId = c.req.param('resourceId')
+  const match = matchResourceId(c.req.param('resourceId'))
+
+  if (!match) {
+    return c.json({ error: 'Resource not found' }, 404)
+  }
 
   // Verify the resource exists and is active
-  const resource = await db
+  const [resource] = await db
     .select({ id: learning_resources.id })
     .from(learning_resources)
-    .where(
-      and(
-        eq(learning_resources.id, resourceId),
-        eq(learning_resources.is_active, true),
-      ),
-    )
+    .where(and(match, eq(learning_resources.is_active, true)))
     .limit(1)
 
-  if (resource.length === 0) {
+  if (!resource) {
     return c.json({ error: 'Resource not found' }, 404)
   }
 
   // ON CONFLICT DO NOTHING makes this idempotent
   await db
     .insert(saved_courses)
-    .values({ user_id: userId, resource_id: resourceId })
+    .values({ user_id: userId, resource_id: resource.id })
     .onConflictDoNothing()
 
   return c.json({ ok: true })
@@ -94,17 +98,26 @@ savedRouter.post('/:resourceId', async (c) => {
 // ─── DELETE /api/v1/saved/:resourceId ────────────────────────────────────────
 // Removes a saved resource for the authenticated user.
 // Idempotent — removing a resource that isn't saved returns 200, not an error.
+// :resourceId may be a UUID or a legacy MongoDB ID (TODO(legacy-mongo-ids)).
 
 savedRouter.delete('/:resourceId', async (c) => {
   const userId = c.var.userId
-  const resourceId = c.req.param('resourceId')
+  const match = matchResourceId(c.req.param('resourceId'))
+
+  // An id in neither format can't have been saved, so there is nothing to remove.
+  if (!match) {
+    return c.json({ ok: true })
+  }
 
   await db
     .delete(saved_courses)
     .where(
       and(
         eq(saved_courses.user_id, userId),
-        eq(saved_courses.resource_id, resourceId),
+        inArray(
+          saved_courses.resource_id,
+          db.select({ id: learning_resources.id }).from(learning_resources).where(match),
+        ),
       ),
     )
 

@@ -111,10 +111,17 @@ authRouter.post('/refresh', async (c) => {
     return c.json({ error: 'Missing Authorization header' }, 401)
   }
 
+  // Check config outside the try below: a missing secret must return 500,
+  // not a 401 that would sign the user out.
+  const secret = process.env.JWT_SECRET
+  if (!secret) {
+    return c.json({ error: 'Server configuration error' }, 500)
+  }
+
   const incomingToken = header.slice(7)
   let payload: Record<string, unknown>
   try {
-    payload = await verify(incomingToken, jwtSecret(), 'HS256') as Record<string, unknown>
+    payload = await verify(incomingToken, secret, 'HS256') as Record<string, unknown>
   } catch {
     return c.json({ error: 'Invalid or expired refresh token' }, 401)
   }

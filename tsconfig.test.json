@@ -1,0 +1,9 @@
+{
+  // Type-checks the test suite (Vitest itself strips types without checking them).
+  // Not used by `npm run build`, so tests never end up in dist/.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src", "test", "vitest.config.ts"]
+}
