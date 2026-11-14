@@ -1,6 +1,9 @@
 # Builds the Dockerfile, pushes it to Artifact Registry and deploys the API to Cloud Run.
 #
-#   gcloud builds submit --config cloudbuild.api.yaml --project=<project-id> .
+#   gcloud builds submit --config cloudbuild.api.yaml --project=<project-id> \
+#     --substitutions=_TAG=$(git rev-parse --short HEAD) .
+#
+# Tag images with the commit SHA so every revision maps to a commit.
 #
 # $PROJECT_ID is provided by Cloud Build. Override any `_` substitution with
 #   --substitutions=_TAG=v1.5.2,_REGION=europe-west1
@@ -43,14 +46,17 @@ steps:
       - 2Gi
       - --cpu
       - '2'
+      # Keep max instances x DB pool size (10 per instance, src/db/client.ts)
+      # below the database's connection limit. 3 fits a small instance (~50).
       - --max-instances
-      - '10'
+      - ${_MAX_INSTANCES}
       - --min-instances
       - '0'
       - --concurrency
       - '80'
       - --timeout
       - '300'
+      - --cpu-boost
       - --set-env-vars
       - NODE_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,INSIGHTS_PROVIDER=groq,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},TRUST_PROXY_HOPS=${_TRUST_PROXY_HOPS},ANON_IP_DAILY_LIMIT=${_ANON_IP_DAILY_LIMIT},ANON_GLOBAL_DAILY_LIMIT=${_ANON_GLOBAL_DAILY_LIMIT}
       - --set-secrets
@@ -66,6 +72,7 @@ substitutions:
   _IMAGE: cc-backend
   _SERVICE: cc-backend-v1-5
   _ALLOWED_ORIGINS: https://coursecorrect.fyi
+  _MAX_INSTANCES: '3'
   # Abuse limits: read docs/deployment-gcp.md ("Client IP and abuse limits") before changing.
   # Number of proxies in front of the app: 1 = Cloud Run reached directly (no load balancer or CDN).
   _TRUST_PROXY_HOPS: '1'

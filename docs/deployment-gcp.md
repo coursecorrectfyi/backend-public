@@ -74,10 +74,12 @@ Rotate a secret with `gcloud secrets versions add <name> --data-file=-`.
 
 ```sh
 gcloud builds submit --config cloudbuild.api.yaml --project=$PROJECT_ID \
-  --substitutions=_TAG=latest,_REGION=$REGION,_REPO=$AR_REPO,_SERVICE=cc-backend,_ALLOWED_ORIGINS=https://example.com
+  --substitutions=_TAG=$(git rev-parse --short HEAD),_REGION=$REGION,_REPO=$AR_REPO,_SERVICE=cc-backend,_ALLOWED_ORIGINS=https://example.com
 ```
 
 Substitutions and their defaults are listed at the bottom of the file; override `_SECRETS` if your secret names differ.
+`_MAX_INSTANCES` (default 3) caps the number of API instances. Each instance opens up to 10 database connections, so keep
+`_MAX_INSTANCES × 10` (plus the jobs' connections) below the database's connection limit.
 The abuse-limit substitutions (`_TRUST_PROXY_HOPS`, `_ANON_IP_DAILY_LIMIT`, `_ANON_GLOBAL_DAILY_LIMIT`) are explained in
 [6. Client IP and abuse limits](#6-client-ip-and-abuse-limits). **Read that section before putting anything (load
 balancer, CDN, proxy) in front of the API, or moving the API off Cloud Run.** The Cloud Run service also needs the Cloud SQL connection attached once:
