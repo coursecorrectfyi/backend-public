@@ -22,7 +22,7 @@ export default defineConfig({
     testTimeout: 20_000,
     coverage: {
       provider: 'v8',
-      include: ['src/index.ts', 'src/api/**/*.ts', 'src/lib/embedding/**/*.ts', 'src/lib/ids.ts'],
+      include: ['src/index.ts', 'src/api/**/*.ts', 'src/lib/**/*.ts'],
       reporter: ['text', 'html', 'lcov'],
       reportsDirectory: 'coverage',
     },

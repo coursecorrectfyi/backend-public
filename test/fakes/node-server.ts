@@ -6,7 +6,8 @@
 import { vi } from 'vitest'
 import { singleton } from '../helpers/singleton.js'
 
-export type FetchHandler = (request: Request) => Response | Promise<Response>
+/** Hono's app.fetch: the second argument is the env (@hono/node-server passes { incoming, outgoing }). */
+export type FetchHandler = (request: Request, env?: unknown) => Response | Promise<Response>
 export interface ServeOptions { fetch: FetchHandler; port?: number }
 type ListeningListener = (info: { address: string; family: string; port: number }) => void
 

@@ -3,32 +3,52 @@
  *
  * Auth: optional. Signed-in users send `Authorization: Bearer <token>` and get
  * a higher daily limit (10). Anonymous users send `X-Session-ID: <uuid>` and
- * get a lower limit (5). Both identities are tracked in `chat_usage`.
+ * get a lower limit (5), plus shared per-IP and global caps on anonymous
+ * questions. Limits are counted in `chat_usage` (see chat-usage.ts).
+ *
+ * Request body: see docs/api.md. Size limits are in chat-input.ts.
  *
  * Response: Server-Sent Events stream.
  *   data: {"type":"delta","content":"..."}  — one or more text chunks
  *   data: {"type":"done"}                   — stream complete
- *   HTTP 429 JSON                           — daily limit exceeded (no stream)
+ *   data: {"type":"error","message":"..."}  — generation failed
+ *   HTTP 400 JSON                           — invalid body or identity headers
+ *   HTTP 413 JSON                           — body over 512 KB (src/index.ts)
+ *   HTTP 429 JSON + Retry-After             — a daily limit was reached (no stream)
  */
 
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { verify } from 'hono/jwt'
 import { GoogleGenAI } from '@google/genai'
-import { and, eq, gt, sql } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { db } from '../db/client.js'
-import { learning_resources, chat_usage } from '../db/schema.js'
+import { learning_resources } from '../db/schema.js'
 import { retrieveForQuery } from './rag.js'
 import { matchResourceIds } from './resource-ids.js'
+import { buildRagQuery, parseChatBody, type CurrentPage } from './chat-input.js'
+import {
+  LIMIT_ANONYMOUS, LIMIT_SIGNED_IN, checkAndIncrementUsage, readAnonLimits, refundUsage,
+  secondsUntilUtcMidnight, usageCounters, type LimitScope,
+} from './chat-usage.js'
+import { isUuid } from '../lib/ids.js'
+import { clientKey, trustProxyHops } from '../lib/client-ip.js'
+import { log } from '../lib/logger.js'
+import {
+  ClientDisconnected, GenerationTimeout, GENERATION_TIMEOUT_MS, MAX_OUTPUT_TOKENS, MODEL, TEMPERATURE,
+  THINKING_BUDGET, TRUNCATION_NOTICE, abortable, untilAborted,
+} from './chat-generation.js'
 
 export const chatRouter = new Hono()
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const LIMIT_SIGNED_IN = 10
-const LIMIT_ANONYMOUS = 5
 const RAG_K = 6
-const MODEL = 'gemini-2.5-flash'
+
+// Read once at startup: an invalid value throws, so a bad deploy config stops
+// the new revision from starting instead of running with unintended limits.
+const ANON_LIMITS = readAnonLimits()
+const TRUST_PROXY_HOPS = trustProxyHops()
 
 const ai = new GoogleGenAI({
   vertexai: true,
@@ -36,98 +56,58 @@ const ai = new GoogleGenAI({
   location: 'us-central1',
 })
 
-// ─── Usage limit enforcement (M8.3) ──────────────────────────────────────────
-//
-// Hold, then release: a question is counted when it arrives and given back
-// (refundUsage) if Gemini fails before sending any text. Requests over the
-// limit are rejected and leave no trace in the DB.
-//
-// Checking the limit and counting the question is ONE atomic statement: the
-// upsert only increments while count < limit, and Postgres locks the row while
-// it does so. Simultaneous requests therefore queue up and can't slip past the
-// limit (a separate SELECT-then-INSERT let 9 of 10 simultaneous requests
-// through an anonymous limit of 5).
-
-async function checkAndIncrementUsage(
-  identity: string,
-  identityType: 'user' | 'anon',
-  limit: number,
-): Promise<{ allowed: false; remaining: 0 } | { allowed: true; remaining: number; queryDate: string }> {
-  const [counted] = await db
-    .insert(chat_usage)
-    .values({
-      identity,
-      identity_type: identityType,
-      query_date: sql`CURRENT_DATE`,
-      count: 1,
-    })
-    .onConflictDoUpdate({
-      target: [chat_usage.identity, chat_usage.query_date],
-      set: { count: sql`${chat_usage.count} + 1` },
-      // Only count the question while under the limit. When this is false,
-      // nothing is updated and no row comes back.
-      setWhere: sql`${chat_usage.count} < ${limit}`,
-    })
-    .returning({ count: chat_usage.count, queryDate: chat_usage.query_date })
-
-  if (!counted) {
-    return { allowed: false, remaining: 0 }
-  }
-
-  return { allowed: true, remaining: limit - counted.count, queryDate: counted.queryDate }
-}
-
-/**
- * Gives back a question that was counted but never answered (Gemini failed
- * before sending any text). Uses the date the question was counted against,
- * so a failure just after midnight doesn't take one off the new day.
- */
-async function refundUsage(identity: string, queryDate: string): Promise<void> {
-  await db
-    .update(chat_usage)
-    .set({ count: sql`${chat_usage.count} - 1` })
-    .where(
-      and(
-        eq(chat_usage.identity, identity),
-        eq(chat_usage.query_date, queryDate),
-        gt(chat_usage.count, 0),
-      ),
-    )
-}
-
 // ─── Identity resolution ──────────────────────────────────────────────────────
 //
-// Returns { identity, identityType, limit } from the request context.
-// Signed-in: verifies the backend JWT and extracts the Firebase UID.
-// Anonymous: uses the X-Session-ID header (client-generated UUID in localStorage).
+// Signed-in: verifies the backend JWT and uses the Firebase UID.
+// Anonymous: uses the X-Session-ID header, a UUID the browser generates and
+// keeps in localStorage. It must be a UUID (stored lowercase): free-form ids
+// could be made up endlessly, grow chat_usage without bound, or collide with a
+// Firebase UID and use up that user's questions.
+
+type Identity = { kind: 'user' | 'anon'; identity: string }
 
 async function resolveIdentity(
   authHeader: string | undefined,
   sessionId: string | undefined,
   secret: string,
-): Promise<{ identity: string; identityType: 'user' | 'anon'; limit: number } | null> {
+): Promise<Identity | { error: string }> {
   if (authHeader?.startsWith('Bearer ')) {
     try {
       const token = authHeader.slice(7)
       const payload = await verify(token, secret, 'HS256') as Record<string, unknown>
       if (payload['type'] === 'access' && typeof payload['sub'] === 'string') {
-        return { identity: payload['sub'], identityType: 'user', limit: LIMIT_SIGNED_IN }
+        return { kind: 'user', identity: payload['sub'] }
       }
     } catch {
       // Invalid token — fall through to anonymous
     }
   }
 
-  if (sessionId?.trim()) {
-    return { identity: sessionId.trim(), identityType: 'anon', limit: LIMIT_ANONYMOUS }
+  const session = sessionId?.trim()
+  if (!session) {
+    return { error: 'Provide Authorization: Bearer <token> or X-Session-ID header' }
   }
+  if (!isUuid(session)) {
+    return { error: 'X-Session-ID must be a UUID' }
+  }
+  return { kind: 'anon', identity: session.toLowerCase() }
+}
 
-  return null
+/** The 429 message for each limit. The frontend shows it as is. */
+function limitMessage(scope: LimitScope): string {
+  switch (scope) {
+    case 'user':
+      return `You've used all ${LIMIT_SIGNED_IN} of your daily questions. Your limit resets at midnight UTC.`
+    case 'session':
+      return `You've used all ${LIMIT_ANONYMOUS} of your daily questions. Sign in to get ${LIMIT_SIGNED_IN} questions per day.`
+    case 'ip':
+      return `Too many questions from your network today. Sign in to get ${LIMIT_SIGNED_IN} questions per day.`
+    case 'global':
+      return `Cora has reached today's limit for guest questions. Sign in to get ${LIMIT_SIGNED_IN} questions per day.`
+  }
 }
 
 // ─── System prompt assembly ───────────────────────────────────────────────────
-
-type CurrentPage = 'SearchResult' | 'SavedCourses' | 'CourseDetail' | 'SubjectPage'
 
 function pageDescription(currentPage: CurrentPage, searchTerm?: string): string {
   switch (currentPage) {
@@ -269,58 +249,39 @@ chatRouter.post('/', async (c) => {
     return c.json({ error: 'Invalid JSON body' }, 400)
   }
 
-  const message = typeof body['message'] === 'string' ? body['message'].trim() : ''
-  if (!message) {
-    return c.json({ error: 'message is required' }, 400)
+  // Validates `message` and bounds every other field (see chat-input.ts).
+  // Page context ids may be UUIDs or legacy MongoDB ids (see matchResourceIds).
+  // History is prior conversation turns, oldest first.
+  const parsed = parseChatBody(body)
+  if (!parsed.ok) {
+    return c.json(parsed.error, 400)
+  }
+  const { message, pageContextIds, currentPage, searchTerm, history } = parsed.input
+
+  // ── 2. Resolve identity and enforce usage limits (see chat-usage.ts) ─────
+
+  const resolved = await resolveIdentity(c.req.header('Authorization'), c.req.header('X-Session-ID'), secret)
+  if ('error' in resolved) {
+    return c.json({ error: resolved.error }, 400)
   }
 
-  // Accept both `pageContextIds` (new) and `courseIds` (legacy frontend) during transition.
-  // Each id may be a UUID or a legacy MongoDB ID (see matchResourceIds).
-  const rawIds = body['pageContextIds'] ?? body['courseIds']
-  const pageContextIds: string[] = Array.isArray(rawIds)
-    ? rawIds.filter((id): id is string => typeof id === 'string')
-    : []
-
-  const currentPage = (typeof body['currentPage'] === 'string'
-    ? body['currentPage']
-    : 'SearchResult') as CurrentPage
-
-  const searchTerm = typeof body['searchTerm'] === 'string' ? body['searchTerm'] : undefined
-
-  // Prior conversation turns, oldest first. Each turn has role ('user'|'bot') and content.
-  const rawHistory = Array.isArray(body['history']) ? body['history'] : []
-  const history = rawHistory.filter(
-    (t): t is { role: 'user' | 'bot'; content: string } =>
-      typeof t === 'object' && t !== null &&
-      (t.role === 'user' || t.role === 'bot') &&
-      typeof t.content === 'string',
-  )
-
-  // ── 2. Resolve identity and enforce usage limit ──────────────────────────
-
-  const authHeader = c.req.header('Authorization')
-  const sessionId  = c.req.header('X-Session-ID')
-
-  const resolved = await resolveIdentity(authHeader, sessionId, secret)
-
-  if (!resolved) {
-    return c.json({ error: 'Provide Authorization: Bearer <token> or X-Session-ID header' }, 400)
+  // Only anonymous questions are counted per IP.
+  const client = resolved.kind === 'anon' ? clientKey(c, TRUST_PROXY_HOPS) : null
+  if (resolved.kind === 'anon' && client === null && ANON_LIMITS.ipDailyLimit > 0) {
+    // Not expected on Cloud Run (its front end always sends X-Forwarded-For):
+    // the per-IP limit is skipped, the session and global limits still apply.
+    log({ event: 'client_ip_unknown', route: 'chat', trust_proxy_hops: TRUST_PROXY_HOPS }, 'warn')
   }
 
-  const { identity, identityType, limit } = resolved
-  const usage = await checkAndIncrementUsage(identity, identityType, limit)
+  const usage = await checkAndIncrementUsage(usageCounters(resolved, client, ANON_LIMITS, secret))
 
   if (!usage.allowed) {
-    const isSignedIn = identityType === 'user'
-    return c.json(
-      {
-        limitReached: true,
-        message: isSignedIn
-          ? `You've used all ${LIMIT_SIGNED_IN} of your daily questions. Your limit resets at midnight UTC.`
-          : `You've used all ${LIMIT_ANONYMOUS} of your daily questions. Sign in to get ${LIMIT_SIGNED_IN} questions per day.`,
-      },
-      429,
-    )
+    if (usage.scope === 'ip' || usage.scope === 'global') {
+      // Signals abuse, or a shared-IP misconfiguration (see docs/deployment-gcp.md).
+      log({ event: 'chat_limit_reached', scope: usage.scope }, 'warn')
+    }
+    c.header('Retry-After', String(secondsUntilUtcMidnight()))
+    return c.json({ limitReached: true, message: limitMessage(usage.scope) }, 429)
   }
 
   // ── 3. Fetch page context resources from DB ──────────────────────────────
@@ -367,16 +328,9 @@ chatRouter.post('/', async (c) => {
 
   // ── 4. RAG retrieval — top-k from catalogue, excluding page context ──────
   //
-  // Augment the query with the last bot turn when the current message is short
-  // (e.g. "give me the link", "tell me more"). Short messages carry weak
-  // semantic signal; the prior bot turn likely contains the resource name the
-  // user is following up on, giving retrieval the context it needs.
+  // Short follow-ups are augmented with the last bot turn (see buildRagQuery).
 
-  const lastBotMessage = [...history].reverse().find(t => t.role === 'bot')
-  const ragQuery =
-    message.length < 60 && lastBotMessage
-      ? `${message} ${lastBotMessage.content}`
-      : message
+  const ragQuery = buildRagQuery(message, history)
 
   let ragResources: Awaited<ReturnType<typeof retrieveForQuery>> = []
   try {
@@ -391,13 +345,27 @@ chatRouter.post('/', async (c) => {
 
   const systemPrompt = buildSystemPrompt(currentPage, searchTerm, pageContextResources, ragResources)
 
-  const { queryDate } = usage
+  const { queryDate, identities } = usage
 
   return streamSSE(c, async (stream) => {
-    // Whether any answer text reached the user. If Gemini fails before that,
-    // the question is given back (refundUsage) so outages don't use up the
-    // daily limit. A partial answer still counts.
-    let answered = false
+    // Stop waiting for Gemini when the client goes away or the answer takes
+    // too long (see chat-generation.ts). Both end the request at once.
+    const clientGone = new AbortController()
+    stream.onAbort(() => clientGone.abort(new ClientDisconnected()))
+    const timeout = new AbortController()
+    const timer = setTimeout(() => timeout.abort(new GenerationTimeout()), GENERATION_TIMEOUT_MS)
+    const signal = AbortSignal.any([clientGone.signal, timeout.signal])
+
+    // Whether Gemini produced any answer text. If it fails (or times out)
+    // before that, the question is given back (refundUsage) so outages don't
+    // use up the daily limit. Set before the text is written, so a client that
+    // doesn't read the stream can't turn a delivered answer into a refund.
+    let gotText = false
+    let finishReason: string | undefined
+    let usageMetadata: { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number } | undefined
+    let outcome: 'completed' | 'truncated' | 'client_disconnected' | 'timeout' | 'error' = 'completed'
+    const startedAt = Date.now()
+
     try {
       // Build multi-turn contents: prior history + current user message.
       // Gemini uses 'user' and 'model' roles — 'bot' maps to 'model'.
@@ -409,36 +377,67 @@ chatRouter.post('/', async (c) => {
         { role: 'user', parts: [{ text: message }] },
       ]
 
-      const response = await ai.models.generateContentStream({
+      const response = await untilAborted(ai.models.generateContentStream({
         model: MODEL,
         contents,
         config: {
           systemInstruction: systemPrompt,
-          temperature: 0.7,
-          maxOutputTokens: 8192,
+          temperature: TEMPERATURE,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          thinkingConfig: { thinkingBudget: THINKING_BUDGET },
+          abortSignal: signal,
         },
-      })
+      }), signal)
 
-      for await (const chunk of response) {
+      for await (const chunk of abortable(response, signal)) {
+        finishReason = chunk.candidates?.[0]?.finishReason ?? finishReason
+        usageMetadata = chunk.usageMetadata ?? usageMetadata
         const text = chunk.text
         if (text) {
+          gotText = true
           await stream.writeSSE({
             data: JSON.stringify({ type: 'delta', content: text }),
           })
-          answered = true
         }
       }
 
-      await stream.writeSSE({ data: JSON.stringify({ type: 'done' }) })
+      // The answer reached ANSWER_MAX_TOKENS: say so instead of ending mid-sentence.
+      const truncated = finishReason === 'MAX_TOKENS'
+      if (truncated) {
+        outcome = 'truncated'
+        await stream.writeSSE({ data: JSON.stringify({ type: 'delta', content: TRUNCATION_NOTICE }) })
+      }
+      await stream.writeSSE({ data: JSON.stringify(truncated ? { type: 'done', truncated: true } : { type: 'done' }) })
     } catch (err) {
+      if (clientGone.signal.aborted) {
+        // Nobody is listening. The question still counts: Gemini was already
+        // called (and bills for it), and refunding would let a client get
+        // unlimited questions by disconnecting before the first word.
+        outcome = 'client_disconnected'
+        return
+      }
+      outcome = timeout.signal.aborted ? 'timeout' : 'error'
       console.error('[chat] Gemini streaming error:', err)
-      if (!answered) {
-        await refundUsage(identity, queryDate).catch((refundErr: unknown) => {
+      if (!gotText) {
+        await refundUsage(identities, queryDate).catch((refundErr: unknown) => {
           console.error('[chat] failed to refund unanswered question:', refundErr)
         })
       }
       await stream.writeSSE({
         data: JSON.stringify({ type: 'error', message: 'Something went wrong. Please try again.' }),
+      })
+    } finally {
+      clearTimeout(timer)
+      // One line per question for cost monitoring (docs/operations.md). No
+      // message content and no identity, only the kind of user.
+      log({
+        event: 'chat_answer',
+        outcome,
+        identity_type: resolved.kind,
+        duration_ms: Date.now() - startedAt,
+        prompt_tokens: usageMetadata?.promptTokenCount ?? null,
+        thinking_tokens: usageMetadata?.thoughtsTokenCount ?? null,
+        answer_tokens: usageMetadata?.candidatesTokenCount ?? null,
       })
     }
   })

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { loadApp, loadFreshApp } from './helpers/app.js'
 import { serve } from './fakes/node-server.js'
 import { db, resetDb } from './fakes/db.js'
+import { setChatUsage } from './helpers/fixtures.js'
 
 beforeEach(resetDb)
 
@@ -118,6 +119,23 @@ describe('CORS', () => {
     const app = await loadFreshApp()
     const res = await app.get('/health', { Origin: 'https://evil.example' })
     expect(res.headers.get('Access-Control-Allow-Origin')).toBeNull()
+  })
+
+  // Browsers hide every response header that isn't CORS-safelisted from frontend
+  // code unless Access-Control-Expose-Headers lists it. The tests can't run a
+  // browser, so they check the server's half: the header is sent AND exposed.
+  it('exposes Retry-After to frontend code on a chat 429 from an allowed origin', async () => {
+    vi.stubEnv('ALLOWED_ORIGINS', 'https://coursecorrect.fyi')
+    const app = await loadFreshApp()
+    const sessionId = '3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a60'
+    await setChatUsage(sessionId, 'anon', 5)
+    const res = await app.post('/api/v1/chat', { message: 'hi' }, {
+      'X-Session-ID': sessionId, Origin: 'https://coursecorrect.fyi',
+    })
+    expect(res.status).toBe(429)
+    expect(Number(res.headers.get('Retry-After'))).toBeGreaterThan(0)
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('https://coursecorrect.fyi')
+    expect(res.headers.get('Access-Control-Expose-Headers')?.split(',').map(h => h.trim())).toContain('Retry-After')
   })
 
   it('still serves requests without an Origin header (server-to-server, health checks)', async () => {

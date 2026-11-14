@@ -13,9 +13,21 @@ export interface TestClient {
   delete(path: string, headers?: Record<string, string>): Promise<Response>
 }
 
+/**
+ * The socket address the app sees for every test request. On Cloud Run the
+ * TCP peer is Google's front end, never the visitor, so by default all test
+ * requests share this address. Send an X-Forwarded-For header to act as a
+ * specific visitor, as Cloud Run would: with TRUST_PROXY_HOPS=1 the app uses
+ * its last entry (see src/lib/client-ip.ts).
+ */
+export const PROXY_SOCKET_ADDRESS = '169.254.1.1'
+
+/** The env @hono/node-server passes to app.fetch; only the socket address is used. */
+const nodeServerEnv = { incoming: { socket: { remoteAddress: PROXY_SOCKET_ADDRESS } } }
+
 function createClient(fetch: FetchHandler): TestClient {
   const request = async (path: string, init?: RequestInit) =>
-    fetch(new Request(`http://localhost${path}`, init))
+    fetch(new Request(`http://localhost${path}`, init), nodeServerEnv)
   return {
     fetch,
     request,

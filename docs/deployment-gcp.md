@@ -77,7 +77,10 @@ gcloud builds submit --config cloudbuild.api.yaml --project=$PROJECT_ID \
   --substitutions=_TAG=latest,_REGION=$REGION,_REPO=$AR_REPO,_SERVICE=cc-backend,_ALLOWED_ORIGINS=https://example.com
 ```
 
-Substitutions and their defaults are listed at the bottom of the file; override `_SECRETS` if your secret names differ. The Cloud Run service also needs the Cloud SQL connection attached once:
+Substitutions and their defaults are listed at the bottom of the file; override `_SECRETS` if your secret names differ.
+The abuse-limit substitutions (`_TRUST_PROXY_HOPS`, `_ANON_IP_DAILY_LIMIT`, `_ANON_GLOBAL_DAILY_LIMIT`) are explained in
+[6. Client IP and abuse limits](#6-client-ip-and-abuse-limits). **Read that section before putting anything (load
+balancer, CDN, proxy) in front of the API, or moving the API off Cloud Run.** The Cloud Run service also needs the Cloud SQL connection attached once:
 
 ```sh
 gcloud run services update cc-backend --add-cloudsql-instances=$SQL_CONNECTION --region=$REGION --project=$PROJECT_ID
@@ -172,3 +175,193 @@ UPDATE learning_resources SET ai_insights = NULL, ai_insights_updated_at = NULL;
 ```
 
 Documents are embedded from `{title} | {provider_type} | {institution} | {level} | {skills} | {ai_summary}` with task type `RETRIEVAL_DOCUMENT`; search queries use `RETRIEVAL_QUERY` through `embedQuery()`. Change both sides together and re-embed.
+
+## 6. Client IP and abuse limits
+
+The API limits anonymous chat questions per visitor IP, so that making up new `X-Session-ID`s doesn't give unlimited
+free questions. This only works if the API identifies the visitor's IP correctly, and that depends on what sits in
+front of it. The code is in `src/lib/client-ip.ts` and `src/api/chat-usage.ts`. The client-facing contract is in
+[api.md](api.md#post-apiv1chat-browser-only), and the short list of what to do per release and what to monitor is in
+[operations.md](operations.md).
+
+### Settings
+
+| Env var (Cloud Build substitution) | Default | Meaning |
+|---|---|---|
+| `TRUST_PROXY_HOPS` (`_TRUST_PROXY_HOPS`) | `1` | Number of proxies between the internet and the app. **`1` = Cloud Run reached directly**, which is our setup |
+| `ANON_IP_DAILY_LIMIT` (`_ANON_IP_DAILY_LIMIT`) | `20` | Anonymous questions per visitor IP (IPv6: per /64) per UTC day, across all sessions. `0` = off |
+| `ANON_GLOBAL_DAILY_LIMIT` (`_ANON_GLOBAL_DAILY_LIMIT`) | `1000` | Anonymous questions per UTC day from all visitors together: a hard ceiling on anonymous chat cost. `0` = off |
+
+Fixed in code: 5 questions per anonymous session and 10 per signed-in user per day. Signed-in users are never subject to
+the IP or global limits.
+
+All three values must be non-negative integers. Anything else stops the new revision from starting, and Cloud Run keeps
+serving the previous one.
+
+### How the API finds the visitor's IP
+
+The app never sees the visitor's connection. On Cloud Run, Google's front end terminates the connection and opens a new
+one to the container, so the socket address is always Google's:
+
+```
+browser ──► Google Front End (Cloud Run) ──► container
+```
+
+Each proxy **appends** the address that connected to it to the `X-Forwarded-For` header. Whatever the client put in that
+header stays on the left and can be forged:
+
+```
+X-Forwarded-For: 192.0.2.66 (fake, written by the client), 203.0.113.7 (appended by Google)
+```
+
+The app builds the chain `[...X-Forwarded-For entries, socket address]` and uses the address `TRUST_PROXY_HOPS` places
+from the right. This is the same rule as Express's `trust proxy` setting. With `1` on Cloud Run that's the entry Google
+appended, which the client can't forge. IPv6 addresses are grouped by /64, because one home or phone usually gets a whole
+/64. If the chosen entry isn't a valid IP, the per-IP limit is skipped for that request and `client_ip_unknown` is logged.
+
+### Which calls this applies to
+
+Only `POST /api/v1/chat` is limited per IP, and the frontend calls it **from the browser**, so the IP is the visitor's.
+These endpoints are called from the **Next.js server**, so the API sees the frontend's Cloud Run IP, shared by all
+visitors: `POST /auth/refresh`, `POST /auth/logout`, `GET /resources/:id`, `GET /subjects`, `GET /subjects/:slug`.
+None of them have per-IP limits. **Never move the chat call to the Next.js server** (API route, server action, rewrite):
+all visitors would then share the 20-a-day network limit.
+
+### What a wrong `TRUST_PROXY_HOPS` does
+
+| Setting | Effect | How you notice |
+|---|---|---|
+| **Too low** (e.g. `0` on Cloud Run, or `1` behind a load balancer) | The proxy's own address is used: **every visitor shares one IP**, so anonymous chat stops for everyone after 20 questions a day | `chat_limit_reached` with `scope: "ip"` shows up in the logs a lot. Check 2 below shows one network |
+| **Too high** (e.g. `2` on Cloud Run directly) | A client-written entry is used: the per-IP limit **can be bypassed** by faking `X-Forwarded-For`. The session and global limits still apply | Silent. Check 1 below catches it |
+
+### Verify before a release gets traffic
+
+There's no staging environment, but Cloud Run can deploy a new revision that **gets no traffic** and has its own URL.
+It runs on the real infrastructure (same front end, database and Gemini), so the checks below can run before any
+visitor reaches the new version:
+
+```sh
+# 1. Build and push the image only (cloudbuild.api.yaml would also deploy it with traffic)
+gcloud builds submit --tag=$IMAGE --project=$PROJECT_ID .
+
+# 2. Deploy it as a revision tagged "candidate" that receives no traffic.
+#    Settings not listed here are kept from the current revision.
+gcloud run deploy <service> --image=$IMAGE --region=$REGION --project=$PROJECT_ID \
+  --no-traffic --tag=candidate \
+  --update-env-vars=TRUST_PROXY_HOPS=1,ANON_IP_DAILY_LIMIT=20,ANON_GLOBAL_DAILY_LIMIT=1000
+#    gcloud prints the candidate URL: https://candidate---<service>-<hash>.<region>.run.app
+
+# 3. Run Check 1 and the pre-traffic form of Check 2 (below) against the candidate URL.
+
+# 4. Send all traffic to it (and let future deploys go live as usual)
+gcloud run services update-traffic <service> --to-latest --region=$REGION --project=$PROJECT_ID
+```
+
+The checks use the production database, so they use up your own IP's anonymous questions for the day and add about 20
+to the global count. That doesn't matter.
+
+### Verify after deploying (and after any change in front of the API)
+
+**Check 1: fake IPs don't get around the limit.** Run this from your machine against the URL the browser calls. It sends
+21 anonymous questions, each from a new session with a different fake `X-Forwarded-For`. It costs about 20 tiny Gemini
+calls and uses up your own IP's anonymous questions for the day.
+
+```sh
+API="https://REPLACE-WITH-API-URL"   # the Cloud Run URL the frontend calls
+command -v uuidgen >/dev/null || uuidgen() { cat /proc/sys/kernel/random/uuid; }   # Linux without uuidgen
+for i in $(seq 1 21); do
+  code=$(curl -s -o /tmp/cc-chat.out -w '%{http_code}' -X POST "$API/api/v1/chat" \
+    -H 'Content-Type: application/json' \
+    -H "X-Session-ID: $(uuidgen)" \
+    -H "X-Forwarded-For: 198.51.100.$i" \
+    -d '{"message":"hi"}')
+  echo "$i: $code $([ "$code" = 429 ] && cat /tmp/cc-chat.out)"
+done
+```
+
+This script was tested against the app behind a proxy that behaves like Cloud Run's front end (`429` on the 21st), and
+without one (all `200`, the misconfiguration case).
+
+Expected: `429` with *"Too many questions from your network today…"* **by the 21st request at the latest**. It comes
+earlier if your IP already asked questions today. If all 21 return `200`, faked IPs are being trusted: `TRUST_PROXY_HOPS`
+is too high, or the IP limit is off (`ANON_IP_DAILY_LIMIT=0`).
+
+**Check 2: visitors aren't sharing one IP.** Once there's been real anonymous traffic (e.g. the next day):
+
+```sql
+SELECT query_date,
+       COUNT(*) FILTER (WHERE identity_type = 'anon') AS anonymous_sessions,
+       COUNT(*) FILTER (WHERE identity_type = 'ip')   AS networks,
+       MAX(count) FILTER (WHERE identity_type = 'ip') AS busiest_network_questions
+FROM chat_usage
+WHERE query_date >= CURRENT_DATE - 7
+GROUP BY query_date ORDER BY query_date DESC;
+```
+
+Healthy: `networks` grows with `anonymous_sessions`. Misconfigured (hops too low): `networks` is `1` every day while there
+are many sessions.
+
+*Pre-traffic form* (against a candidate revision, or right after a deploy): ask one anonymous question from **two
+different networks**, e.g. your laptop on Wi-Fi and again with the laptop tethered to a phone on mobile data. Then:
+
+```sql
+SELECT COUNT(*) FROM chat_usage WHERE identity_type = 'ip' AND query_date = CURRENT_DATE;
+```
+
+Run it before and after. It should go up by **2**. If it goes up by 1, both networks were counted as the same IP
+(hops too low). Before this release no version wrote `ip` rows, so during a candidate test only your requests add them.
+
+### Monitoring
+
+Both events are structured logs (`jsonPayload.event`) with severity `WARNING`:
+
+```sh
+# Limits reached: scope "ip" (one network) or "global" (all anonymous chat is off until midnight UTC)
+gcloud logging read 'resource.type="cloud_run_revision" AND jsonPayload.event="chat_limit_reached"' \
+  --project=$PROJECT_ID --freshness=1d --format='value(timestamp, jsonPayload.scope)'
+
+# Requests whose client IP couldn't be determined (should never happen on Cloud Run)
+gcloud logging read 'resource.type="cloud_run_revision" AND jsonPayload.event="client_ip_unknown"' \
+  --project=$PROJECT_ID --freshness=1d
+```
+
+Worth setting up [log-based alerts](https://cloud.google.com/logging/docs/alerting/log-based-alerts) for
+`scope="global"` (anonymous chat is off for everyone, possibly an attack) and for any `client_ip_unknown`. Occasional
+`scope="ip"` entries are normal: a shared office or campus network, or someone rotating sessions.
+
+To choose `ANON_GLOBAL_DAILY_LIMIT`, look at normal anonymous volume and set it a few times higher:
+
+```sql
+SELECT query_date, count FROM chat_usage WHERE identity = 'global:anon' ORDER BY query_date DESC LIMIT 30;
+```
+
+### Changing limits, and emergency switches
+
+- **Permanently:** change the substitution in `cloudbuild.api.yaml` (or pass `--substitutions`) and deploy.
+- **Immediately**, without a build (creates a new revision in about a minute):
+  ```sh
+  gcloud run services update <service> --region=$REGION --project=$PROJECT_ID \
+    --update-env-vars=ANON_IP_DAILY_LIMIT=0          # e.g. visitors wrongly share one IP
+  ```
+  The next Cloud Build deploy sets every env var back to the substitution values (`--set-env-vars` replaces them all),
+  so make the same change in `cloudbuild.api.yaml` too.
+- New limits apply right away to today's counts. Lowering a limit below today's count blocks that counter until midnight UTC.
+
+### Revisit `TRUST_PROXY_HOPS` whenever the path to the API changes
+
+| Change | What to do |
+|---|---|
+| Add a Google Cloud external Application Load Balancer (needed for Cloud Armor, Cloud CDN, serverless NEGs) | `TRUST_PROXY_HOPS=2`, **and** set the service's ingress to `internal-and-cloud-load-balancing`. Otherwise anyone can call the `run.app` URL directly and fake the entry the app now trusts |
+| Put Cloudflare or another CDN/WAF in front | Add one hop per proxy, and make sure the origin only accepts traffic from the CDN (same reason) |
+| Firebase Hosting rewrites, or a custom domain in front of the API | It may add a proxy. Run Check 1 and Check 2 |
+| Route any per-IP-limited call through the Next.js server | Don't (see above). If it's ever unavoidable, the frontend must forward the visitor's IP and the API must verify that with a shared secret. That needs new code |
+| **Move off Cloud Run** | Count the proxies on the new platform. Plain VM or container with a public IP and no proxy: `0`. Behind nginx, Traefik, Caddy or a Kubernetes ingress: the number of proxies, each configured to *append* to `X-Forwarded-For` (nginx: `$proxy_add_x_forwarded_for`). PaaS such as Fly.io, Render, Railway or Heroku: read their docs, since some use a different header (e.g. `Fly-Client-IP`), which would need a code change. A runtime other than Node (`@hono/node-server`: e.g. Bun, Deno, Workers) also needs `clientKey()` in `src/lib/client-ip.ts` updated to read the socket address; until then the per-IP limit is skipped and `client_ip_unknown` is logged. Then run Check 1 and Check 2 |
+
+### Other requirements
+
+- **Cloud SQL must use UTC** (the default; check with `SHOW timezone;`). The limits count per `CURRENT_DATE` and reset at
+  midnight UTC, and `Retry-After` is calculated on that basis.
+- **Privacy:** IPs are never stored or logged. Each is stored as `ip:<HMAC-SHA256 of date + IP>`, keyed with a key
+  derived from `JWT_SECRET`, so it can't be reversed or linked across days. The rows are covered by the `chat_usage`
+  retention item in the README To do list.
+- **Rotating `JWT_SECRET`** (which already signs everyone out) also restarts today's per-IP counts. That's harmless.

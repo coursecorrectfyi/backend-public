@@ -67,3 +67,22 @@ export async function chatUsageToday(identity: string): Promise<number> {
 export async function allUsers() {
   return db.select().from(users)
 }
+
+/**
+ * Sets today's anonymous-question count for a client IP (as the app keys it:
+ * see ipIdentity in src/api/chat-usage.ts).
+ */
+export async function setIpUsage(clientKey: string, count: number) {
+  const { ipIdentity, utcDate } = await import('../../src/api/chat-usage.js')
+  await db.insert(chat_usage).values({
+    identity: ipIdentity(clientKey, utcDate(), process.env.JWT_SECRET!),
+    identity_type: 'ip',
+    query_date: sql`CURRENT_DATE`,
+    count,
+  })
+}
+
+/** Today's count on the global anonymous counter. */
+export async function globalAnonUsageToday(): Promise<number> {
+  return chatUsageToday('global:anon')
+}

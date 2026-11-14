@@ -52,7 +52,7 @@ steps:
       - --timeout
       - '300'
       - --set-env-vars
-      - NODE_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,INSIGHTS_PROVIDER=groq,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}
+      - NODE_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,INSIGHTS_PROVIDER=groq,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},TRUST_PROXY_HOPS=${_TRUST_PROXY_HOPS},ANON_IP_DAILY_LIMIT=${_ANON_IP_DAILY_LIMIT},ANON_GLOBAL_DAILY_LIMIT=${_ANON_GLOBAL_DAILY_LIMIT}
       - --set-secrets
       - ${_SECRETS}
 
@@ -66,6 +66,13 @@ substitutions:
   _IMAGE: cc-backend
   _SERVICE: cc-backend-v1-5
   _ALLOWED_ORIGINS: https://coursecorrect.fyi
+  # Abuse limits: read docs/deployment-gcp.md ("Client IP and abuse limits") before changing.
+  # Number of proxies in front of the app: 1 = Cloud Run reached directly (no load balancer or CDN).
+  _TRUST_PROXY_HOPS: '1'
+  # Anonymous chat questions per visitor IP per day, across sessions (0 = off)
+  _ANON_IP_DAILY_LIMIT: '20'
+  # Anonymous chat questions per day, all visitors together (0 = off)
+  _ANON_GLOBAL_DAILY_LIMIT: '1000'
   # ENV_VAR=secret-name:version pairs from Secret Manager (see docs/deployment-gcp.md)
   _SECRETS: DATABASE_URL=database-url:latest,JWT_SECRET=jwt-secret:latest,GEMINI_API_KEY=gemini-api-key:latest,GROQ_API_KEY=groq-api-key:latest
 

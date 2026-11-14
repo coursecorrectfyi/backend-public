@@ -9,6 +9,8 @@ import { resourcesRouter } from './api/resources.js'
 import { savedRouter } from './api/saved.js'
 import { subjectsRouter } from './api/subjects.js'
 import { chatRouter } from './api/chat.js'
+import { CHAT_LIMITS } from './api/chat-input.js'
+import { DEFAULT_MAX_BODY_BYTES, requestBodyLimit } from './api/middleware/body-limit.js'
 
 const app = new Hono()
 
@@ -21,7 +23,19 @@ app.use('*', cors({
   origin: (origin) => allowedOrigins.includes(origin) ? origin : null,
   allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Session-ID'],
+  // Browsers only let frontend code read a few "safe" response headers on
+  // cross-origin responses (Content-Type, Cache-Control, ...). Every other
+  // header it should read must be listed here, or headers.get() returns null
+  // even though the header was sent. Retry-After comes with every 429.
+  exposeHeaders: ['Retry-After'],
   maxAge: 86400,
+}))
+
+// Registered after CORS so a 413 still carries CORS headers and the browser
+// lets the frontend read it.
+app.use('*', requestBodyLimit({
+  defaultMaxBytes: DEFAULT_MAX_BODY_BYTES,
+  routes: { '/api/v1/chat': CHAT_LIMITS.maxBodyBytes },
 }))
 
 app.get('/health', async (c) => {

@@ -22,6 +22,8 @@ API        /api/v1/*  search, detail, saved, subjects, chat (SSE)
 
 Each job is idempotent and works off "what is still NULL" in the database, so jobs can be re-run safely.
 
+The API contract (endpoints, request limits, error responses) is documented in [docs/api.md](docs/api.md). What to remember when running it in production (checks per release, alerts, analytics, privacy) is in [docs/operations.md](docs/operations.md).
+
 **Search** ranks results by combining `ts_rank` over a trigger-maintained `search_document` tsvector with pgvector cosine similarity against the embedded query. **Chat** streams Gemini responses over SSE, grounded in the resources on the user's current page plus retrieved resources (RAG).
 
 ## Project layout
@@ -37,7 +39,7 @@ src/
     insights/           AI insights (Vertex AI, Groq or Gemini)
     onet/               O*NET / BLS occupation data seed + lookup
 migrations/             Drizzle SQL migrations
-docs/                   deployment guide
+docs/                   API reference, deployment guide, operations guide
 ```
 
 ## Getting started
@@ -67,6 +69,9 @@ All configuration is through environment variables (see `.env.example`).
 | `JWT_SECRET` | API | Secret for signing backend JWTs (`openssl rand -base64 48`). |
 | `ALLOWED_ORIGINS` | API | Comma-separated CORS origins. Default `http://localhost:3001`. |
 | `PORT` | API | Default `3000`. |
+| `TRUST_PROXY_HOPS` | API | Proxies in front of the API, used to find the visitor's IP. Default `1` (Cloud Run). `0` when nothing is in front (local). **Read [docs/deployment-gcp.md §6](docs/deployment-gcp.md#6-client-ip-and-abuse-limits) before changing what's in front of the API.** |
+| `ANON_IP_DAILY_LIMIT` | API | Anonymous chat questions per visitor IP per day, across sessions. Default `20`, `0` = off. |
+| `ANON_GLOBAL_DAILY_LIMIT` | API | Anonymous chat questions per day, all visitors together. Default `1000`, `0` = off. |
 | `DRY_RUN_LIMIT` | jobs | Caps the number of items processed. Use for any local run. |
 | `PROVIDER` | embed | Optional: only embed resources from one provider. |
 | `INSIGHTS_PROVIDER` | insights | `vertexai` (default), `groq` or `gemini`. |
@@ -131,12 +136,13 @@ The API runs as a Cloud Run service and the jobs as Cloud Run Jobs, all from the
 
 ## To do
 
+- [ ] **Abuse and cost hardening, next steps.** Chat limits and input caps are done. Planned: per-minute rate limits on browser-called routes, search input limits and an embedding cache, and the Next.js server forwarding the visitor's IP on server-side calls. Frontend follow-ups are in the [frontend alignment checklist](docs/api.md#frontend-alignment-checklist).
 - [ ] **Retire legacy MongoDB ids.** Course detail, saved courses and chat page context accept a resource's UUID or its CourseCorrect 1.0 MongoDB ObjectId (`learning_resources.legacy_mongo_id`).
   1. Confirm no client still sends legacy ids: check the frontend, and the Cloud Run request logs for `/api/v1/resources/<24 hex chars>` and `/api/v1/saved/<24 hex chars>`. Chat sends ids in the request body, which isn't logged, so consider logging a line whenever a legacy id is matched.
   2. Remove `isLegacyMongoId` and update every place tagged `TODO(legacy-mongo-ids)` (`grep -rn "legacy-mongo-ids" src test`), including the tests.
 - [ ] **Retire the chat `courseIds` field.** `POST /api/v1/chat` accepts the legacy `courseIds` field name as well as `pageContextIds`. Remove it once the frontend only sends `pageContextIds`. (This is about the field *name*, not the id format above.)
 - [ ] **Frontend: saved courses order.** `GET /api/v1/saved` now returns newest first. It used to return oldest first, contradicting its own code comment. When working on the frontend, check whether it re-sorts or reverses the list, then decide between using the API order as is and adding a sort option (e.g. `?sort=newest|oldest`) for both orders.
-- [ ] **Retention and cleanup for `chat_usage`.** Nothing deletes from this table, so it grows by one row per person per day of chat use (roughly 150–200 bytes per row with indexes). The daily limit only needs today's row; keep at least the previous day too, because a question held just before midnight is given back to that day's row. Lookups stay fast as the table grows, so this is about storage and privacy, not performance.
+- [ ] **Retention and cleanup for `chat_usage`.** Nothing deletes from this table, so it grows by one row per person per day of chat use (roughly 150–200 bytes per row with indexes). The daily limit only needs today's row; keep at least the previous day too, because a question held just before midnight is given back to that day's row. Lookups stay fast as the table grows, so this is about storage and privacy, not performance. The table also holds per-IP rows (`identity_type = 'ip'`, a keyed hash of date + IP, never a raw IP) and one `global` row per day; the same retention applies.
   - **GDPR:** `identity` holds a Firebase UID for signed-in users and a browser-generated session id for anonymous users. Both are likely personal data: pseudonymous identifiers that can be linked to a person or device. Keeping them indefinitely conflicts with the storage-limitation and data-minimisation principles (Art. 5(1)(e) and 5(1)(c)). Decide and document a retention period, reflect it in the privacy policy, and make sure deleting a user's account also deletes their rows (right to erasure, Art. 17; no account-deletion flow exists in this API yet). Confirm the details with whoever owns privacy/legal.
   - **Decide:** the retention period, and whether to store aggregated, anonymised analytics before purging. For example, a daily summary table (date, `identity_type`, distinct users, questions) with no identities. Truly aggregated counts are not personal data, but avoid very small groups that could single someone out.
   - **Implementation options:**

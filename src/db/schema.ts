@@ -414,23 +414,29 @@ export const onet_wages = pgTable('onet_wages', {
 
 // ─── Chat usage ───────────────────────────────────────────────────────────────
 
+/** Kinds of chat_usage counters (see chat_usage below). */
+export type ChatUsageIdentityType = 'user' | 'anon' | 'ip' | 'global'
+
 /**
- * Daily AI query count per user or anonymous session.
- * Used for server-side rate limiting of the /api/v1/chat endpoint.
+ * Daily chat question counters, used to enforce the /api/v1/chat limits
+ * (src/api/chat-usage.ts). One row per (identity, date); an UPSERT increments it.
  *
- * identity: Firebase UID for signed-in users; client-generated UUID for anonymous
- *   sessions (sent in the X-Session-ID request header, stored in localStorage).
- * identity_type: 'user' | 'anon' — distinguishes the two cases for analytics
- *   and makes it easy to apply different limits per type.
+ * identity / identity_type:
+ *   'user'   Firebase UID of a signed-in user                     (10/day)
+ *   'anon'   anonymous session id: a lowercase UUID the browser
+ *            generates and sends in X-Session-ID                   (5/day)
+ *   'ip'     'ip:<HMAC of date + client IP>' shared by all anonymous
+ *            sessions from one IP (IPv6: one /64). Never a raw IP   (ANON_IP_DAILY_LIMIT)
+ *   'global' 'global:anon', all anonymous questions together       (ANON_GLOBAL_DAILY_LIMIT)
  *
- * One row per (identity, date). UPSERT increments count on each query.
- * Limits: signed-in = 10/day, anonymous = 5/day.
+ * Analytics: count people with identity_type IN ('user', 'anon') only; 'ip'
+ * and 'global' rows are extra counters for the same questions.
  */
 export const chat_usage = pgTable('chat_usage', {
-  /** Firebase UID for signed-in users; client-generated UUID for anonymous sessions */
+  /** See the table comment: Firebase UID, session UUID, 'ip:<hash>' or 'global:anon' */
   identity: text('identity').notNull(),
-  /** 'user' (Firebase UID) | 'anon' (client session UUID) */
-  identity_type: text('identity_type').$type<'user' | 'anon'>().notNull(),
+  /** 'user' | 'anon' | 'ip' | 'global' (see the table comment) */
+  identity_type: text('identity_type').$type<ChatUsageIdentityType>().notNull(),
   /** UTC calendar date — one row per identity per day */
   query_date: date('query_date').notNull(),
   /** Number of chat queries made on this date. Incremented atomically via UPSERT. */
