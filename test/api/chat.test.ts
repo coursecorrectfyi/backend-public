@@ -13,10 +13,17 @@ import {
 import { GENERATION_TIMEOUT_MS, TRUNCATION_NOTICE } from '../../src/api/chat-generation.js'
 import { readSSE } from '../helpers/sse.js'
 import { chatUsageToday, globalAnonUsageToday, insertResource, insertResources, setChatUsage, setIpUsage } from '../helpers/fixtures.js'
-import { captureLogs } from '../helpers/logs.js'
+import { captureLogs, errorLogs } from '../helpers/logs.js'
 import { chat_usage } from '../../src/db/schema.js'
 
 beforeEach(resetDb)
+
+// This file tests the chat route and its daily limits. The per-minute rate
+// limit (10 requests per IP) is a separate layer in front of it, tested in
+// rate-limit.test.ts. It's off here so tests can ask more than 10 questions in
+// a row. The app is loaded once per file, so it keeps the setting from the
+// first test.
+beforeEach(() => vi.stubEnv('RATE_LIMIT_CHAT_PER_MIN', '0'))
 
 const CHAT = '/api/v1/chat'
 // Anonymous session ids are UUIDs, as the frontend makes them with crypto.randomUUID()
@@ -86,8 +93,12 @@ describe('identity and daily limits', () => {
     const res = await chat({ message: 'q6' })
     expect(res.status).toBe(429)
     expect(await res.json()).toEqual({
-      limitReached: true,
+      error: 'Daily limit reached',
+      code: 'daily_limit',
+      scope: 'session',
       message: "You've used all 5 of your daily questions. Sign in to get 10 questions per day.",
+      retryAfter: expect.any(Number),
+      limitReached: true,
     })
     expect(generateContentStream).toHaveBeenCalledTimes(5)
     expect(await chatUsageToday(SESSION_ID)).toBe(5) // denied requests are not counted
@@ -103,8 +114,12 @@ describe('identity and daily limits', () => {
     const res = await chat({ message: 'eleventh' }, headers)
     expect(res.status).toBe(429)
     expect(await res.json()).toEqual({
-      limitReached: true,
+      error: 'Daily limit reached',
+      code: 'daily_limit',
+      scope: 'user',
       message: "You've used all 10 of your daily questions. Your limit resets at midnight UTC.",
+      retryAfter: expect.any(Number),
+      limitReached: true,
     })
   })
 
@@ -113,14 +128,18 @@ describe('identity and daily limits', () => {
     await (await chat({ message: 'hi' }, bearer(await accessToken('fb-user-1')))).text()
     const rows = await db.select().from(chat_usage)
     // People are the 'user' and 'anon' rows; 'ip' and 'global' are extra
-    // counters for anonymous questions (see chat-usage.ts).
+    // counters for the same questions (see chat-usage.ts).
     expect(rows.filter(r => r.identity_type === 'user' || r.identity_type === 'anon')
       .map(r => [r.identity, r.identity_type, r.count]).sort()).toEqual([
       [SESSION_ID, 'anon', 1],
       ['fb-user-1', 'user', 1],
     ])
     expect(rows.filter(r => r.identity_type === 'ip' || r.identity_type === 'global')
-      .map(r => [r.identity_type, r.count]).sort()).toEqual([['global', 1], ['ip', 1]])
+      .map(r => [r.identity_type, r.identity.startsWith('ip:') ? 'ip:<hash>' : r.identity, r.count]).sort()).toEqual([
+      ['global', 'global:anon', 1],
+      ['global', 'global:signed_in', 1],
+      ['ip', 'ip:<hash>', 1],
+    ])
   })
 
   it('counts against the signed-in user when both a token and a session id are sent', async () => {
@@ -248,12 +267,15 @@ describe('usage when Gemini fails', () => {
   })
 
   it('still sends the error event if giving back the question fails', async () => {
+    const logs = captureLogs()
     failWith(new Error('503'))
     const refundError = new Error('database unavailable')
     vi.spyOn(db, 'update').mockImplementationOnce(() => { throw refundError })
     const events = await readSSE(await chat({ message: 'hi' }))
     expect(events).toEqual([{ type: 'error', message: 'Something went wrong. Please try again.' }])
-    expect(console.error).toHaveBeenCalledWith('[chat] failed to refund unanswered question:', refundError)
+    expect(errorLogs(logs(), 'chat_refund_failed')).toEqual([
+      expect.objectContaining({ message: refundError.stack }),
+    ])
   })
 })
 
@@ -278,11 +300,14 @@ describe('SSE streaming', () => {
   })
 
   it('sends an error event (no done) when Gemini rejects the request', async () => {
+    const logs = captureLogs()
     failWith(new Error('quota exceeded'))
     const res = await chat({ message: 'hi' })
     expect(res.status).toBe(200)
     expect(await readSSE(res)).toEqual([{ type: 'error', message: 'Something went wrong. Please try again.' }])
-    expect(console.error).toHaveBeenCalledWith('[chat] Gemini streaming error:', expect.any(Error))
+    expect(errorLogs(logs(), 'chat_generation_failed')).toEqual([
+      expect.objectContaining({ outcome: 'error', message: expect.stringMatching(/^Error: quota exceeded\n/) }),
+    ])
   })
 
   it('sends an error event after partial output when the stream breaks', async () => {
@@ -474,6 +499,7 @@ describe('system prompt: page context and RAG', () => {
   })
 
   it('still answers with page context only when RAG retrieval fails', async () => {
+    const logs = captureLogs()
     const r = await insertResource({ title: 'Page Course', embedding: unitVector(0) })
     embedQuery.mockRejectedValue(new Error('Vertex AI embedding API 500'))
     const res = await chat({ message: 'hi', pageContextIds: [r.id] })
@@ -482,9 +508,9 @@ describe('system prompt: page context and RAG', () => {
     const prompt = lastGeminiRequest().config.systemInstruction
     expect(prompt).toContain('Page Course')
     expect(prompt).not.toContain('## Additional relevant resources')
-    expect(console.error).toHaveBeenCalledWith(
-      '[chat] RAG retrieval failed, continuing without catalogue context:', expect.any(Error),
-    )
+    expect(errorLogs(logs(), 'chat_rag_failed')).toEqual([
+      expect.objectContaining({ message: expect.stringContaining('Vertex AI embedding API 500') }),
+    ])
   })
 })
 
@@ -695,7 +721,14 @@ describe('anonymous limits: session ids, client IPs and the global cap', () => {
 
       const res = await chat({ message: 'again' }, visitor(IP))
       expect(res.status).toBe(429)
-      expect(await res.json()).toEqual({ limitReached: true, message: NETWORK_MESSAGE })
+      expect(await res.json()).toEqual({
+        error: 'Daily limit reached',
+        code: 'daily_limit',
+        scope: 'ip',
+        message: NETWORK_MESSAGE,
+        retryAfter: expect.any(Number),
+        limitReached: true,
+      })
       expect(logs()).toContainEqual(expect.objectContaining({ event: 'chat_limit_reached', scope: 'ip', severity: 'WARNING' }))
     })
 
@@ -731,8 +764,12 @@ describe('anonymous limits: session ids, client IPs and the global cap', () => {
       await setIpUsage(IP, 20)
       const res = await chat({ message: 'hi' }, visitor(IP, SESSION_ID))
       expect(await res.json()).toEqual({
-        limitReached: true,
+        error: 'Daily limit reached',
+        code: 'daily_limit',
+        scope: 'session',
         message: "You've used all 5 of your daily questions. Sign in to get 10 questions per day.",
+        retryAfter: expect.any(Number),
+        limitReached: true,
       })
     })
 
@@ -876,7 +913,9 @@ describe('answer length, timeouts and disconnects', () => {
       expect(await readSSE(res)).toEqual([{ type: 'error', message: 'Something went wrong. Please try again.' }])
       expect(await chatUsageToday(SESSION_ID)).toBe(0)
       expect(answerLogs(logs)).toEqual([expect.objectContaining({ outcome: 'timeout' })])
-      expect(console.error).toHaveBeenCalledWith('[chat] Gemini streaming error:', expect.objectContaining({ name: 'GenerationTimeout' }))
+      expect(errorLogs(logs(), 'chat_generation_failed')).toEqual([
+        expect.objectContaining({ outcome: 'timeout', message: expect.stringContaining('GenerationTimeout') }),
+      ])
     })
 
     it('still counts the question when the timeout hits after part of the answer', async () => {
@@ -944,7 +983,7 @@ describe('answer length, timeouts and disconnects', () => {
       await res.body!.cancel()
       await vi.waitFor(() => expect(answerLogs(logs)).toEqual([expect.objectContaining({ outcome: 'client_disconnected' })]))
       expect(await chatUsageToday(SESSION_ID)).toBe(1)
-      expect(console.error).not.toHaveBeenCalledWith('[chat] Gemini streaming error:', expect.anything())
+      expect(errorLogs(logs(), 'chat_generation_failed')).toEqual([]) // a disconnect isn't an error
     })
   })
 })

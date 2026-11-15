@@ -12,7 +12,7 @@ const GoogleAuth = vi.fn(function (this: unknown) {
 })
 vi.mock('google-auth-library', () => ({ GoogleAuth }))
 
-const { buildEmbeddingInput, embedBatch, embedQuery, EMBEDDING_BATCH_SIZE, EMBEDDING_DIMENSIONS } =
+const { buildEmbeddingInput, embedBatch, embedQuery, EMBEDDING_BATCH_SIZE, EMBEDDING_DIMENSIONS, QUERY_TIMEOUT_MS } =
   await import('../../src/lib/embedding/vertex.js')
 // The auth client is created when the module loads. Vitest clears call history
 // before each test (clearMocks), so record the constructor call now.
@@ -89,6 +89,35 @@ describe('embedQuery', () => {
     getAccessToken.mockRejectedValueOnce(new Error('Could not load the default credentials'))
     await expect(embedQuery('q')).rejects.toThrow('Could not load the default credentials')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  describe('timeout', () => {
+    it('defaults to 5 seconds', () => {
+      expect(QUERY_TIMEOUT_MS).toBe(5_000)
+    })
+
+    it('gives up on a slow API call with a TimeoutError, and cancels the HTTP request', async () => {
+      let signal: AbortSignal | undefined
+      fetchMock.mockImplementation((_url, init) => {
+        signal = init?.signal ?? undefined
+        return new Promise(() => {}) // never answers
+      })
+      const err = await embedQuery('q', { timeoutMs: 30 }).catch((e: Error) => e)
+      expect(err).toMatchObject({ name: 'TimeoutError' })
+      expect(signal?.aborted).toBe(true)
+    })
+
+    it('also gives up when getting the access token hangs', async () => {
+      getAccessToken.mockImplementationOnce(() => new Promise(() => {}))
+      const err = await embedQuery('q', { timeoutMs: 30 }).catch((e: Error) => e)
+      expect(err).toMatchObject({ name: 'TimeoutError' })
+      expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    it('does not affect an answer that arrives in time', async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ predictions: [prediction([0.5])] }))
+      await expect(embedQuery('q', { timeoutMs: 1_000 })).resolves.toEqual([0.5])
+    })
   })
 })
 

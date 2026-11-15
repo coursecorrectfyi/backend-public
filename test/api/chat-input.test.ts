@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   CHAT_LIMITS, buildRagQuery, normalizeCurrentPage, normalizeHistory, normalizePageContextIds,
-  normalizeSearchTerm, parseChatBody, truncate, type HistoryTurn,
+  normalizeSearchTerm, parseChatBody, type HistoryTurn,
 } from '../../src/api/chat-input.js'
 
 const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`
@@ -27,23 +27,6 @@ describe('CHAT_LIMITS', () => {
       searchTermMaxChars: 200,
       ragQueryMaxChars: 4_000,
     })
-  })
-})
-
-describe('truncate', () => {
-  it('returns text at or under the limit unchanged', () => {
-    expect(truncate('abc', 3)).toBe('abc')
-    expect(truncate('', 0)).toBe('')
-  })
-
-  it('cuts text over the limit', () => {
-    expect(truncate('abcdef', 4)).toBe('abcd')
-  })
-
-  it('does not split a surrogate pair (emoji) at the cut', () => {
-    // '😀' is two UTF-16 code units; a cut after its first unit drops the whole emoji
-    expect(truncate('ab😀cd', 3)).toBe('ab')
-    expect(truncate('ab😀cd', 4)).toBe('ab😀')
   })
 })
 

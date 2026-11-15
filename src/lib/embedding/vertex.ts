@@ -34,6 +34,13 @@ export const EMBEDDING_DIMENSIONS = 768
 
 const MAX_RETRIES = 2
 
+/**
+ * How long embedQuery waits (access token + API call) before giving up.
+ * Callers fall back without the embedding (keyword-only search, chat without
+ * catalogue retrieval), so a slow Vertex AI doesn't hold requests open.
+ */
+export const QUERY_TIMEOUT_MS = 5_000
+
 // Singleton auth client — caches tokens and refreshes them automatically.
 const auth = new GoogleAuth({
   scopes: 'https://www.googleapis.com/auth/cloud-platform',
@@ -146,30 +153,44 @@ export async function embedBatch(texts: string[]): Promise<EmbeddingResult[]> {
  * Must use a different task_type from document embeddings (RETRIEVAL_DOCUMENT)
  * so the query lives in the correct semantic space for retrieval.
  *
- * @throws If the API fails — callers should catch and fall back to keyword-only search.
+ * Gives up after `timeoutMs` (default QUERY_TIMEOUT_MS) with a TimeoutError,
+ * even if getting the access token is what hangs. No retries: a user is waiting.
+ *
+ * @throws If the API fails or times out — callers should catch and fall back
+ *         (keyword-only search, chat without catalogue context).
  */
-export async function embedQuery(text: string): Promise<number[]> {
-  const client = await auth.getClient()
-  const { token } = await client.getAccessToken()
-
-  const response = await fetch(API_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      instances: [{ content: text, task_type: 'RETRIEVAL_QUERY' }],
-    }),
+export async function embedQuery(text: string, options: { timeoutMs?: number } = {}): Promise<number[]> {
+  const signal = AbortSignal.timeout(options.timeoutMs ?? QUERY_TIMEOUT_MS)
+  const timedOut = new Promise<never>((_, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true })
   })
 
-  if (!response.ok) {
-    const errorBody = await response.text()
-    throw new Error(`Vertex AI embedding API ${response.status}: ${errorBody.slice(0, 300)}`)
+  const request = async () => {
+    const client = await auth.getClient()
+    const { token } = await client.getAccessToken()
+
+    const response = await fetch(API_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        instances: [{ content: text, task_type: 'RETRIEVAL_QUERY' }],
+      }),
+      signal, // also cancels the HTTP request itself
+    })
+
+    if (!response.ok) {
+      const errorBody = await response.text()
+      throw new Error(`Vertex AI embedding API ${response.status}: ${errorBody.slice(0, 300)}`)
+    }
+
+    const data = (await response.json()) as {
+      predictions: Array<{ embeddings: { values: number[] } }>
+    }
+    return data.predictions[0].embeddings.values
   }
 
-  const data = (await response.json()) as {
-    predictions: Array<{ embeddings: { values: number[] } }>
-  }
-  return data.predictions[0].embeddings.values
+  return Promise.race([request(), timedOut])
 }

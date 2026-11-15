@@ -54,11 +54,12 @@ steps:
       - '0'
       - --concurrency
       - '80'
+      # Longest request: a chat answer, stopped after 2 minutes (src/api/chat-generation.ts)
       - --timeout
-      - '300'
+      - '180'
       - --cpu-boost
       - --set-env-vars
-      - NODE_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,INSIGHTS_PROVIDER=groq,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},TRUST_PROXY_HOPS=${_TRUST_PROXY_HOPS},ANON_IP_DAILY_LIMIT=${_ANON_IP_DAILY_LIMIT},ANON_GLOBAL_DAILY_LIMIT=${_ANON_GLOBAL_DAILY_LIMIT}
+      - NODE_ENV=production,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,INSIGHTS_PROVIDER=groq,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},TRUST_PROXY_HOPS=${_TRUST_PROXY_HOPS},ANON_IP_DAILY_LIMIT=${_ANON_IP_DAILY_LIMIT},ANON_GLOBAL_DAILY_LIMIT=${_ANON_GLOBAL_DAILY_LIMIT},SIGNED_IN_GLOBAL_DAILY_LIMIT=${_SIGNED_IN_GLOBAL_DAILY_LIMIT},CHAT_MODE=${_CHAT_MODE},AUTH_ALLOWED_PROVIDERS=${_AUTH_ALLOWED_PROVIDERS},RATE_LIMIT_MODE=${_RATE_LIMIT_MODE},RATE_LIMIT_CHAT_PER_MIN=${_RATE_LIMIT_CHAT_PER_MIN},RATE_LIMIT_SEARCH_PER_MIN=${_RATE_LIMIT_SEARCH_PER_MIN},RATE_LIMIT_LOGIN_PER_MIN=${_RATE_LIMIT_LOGIN_PER_MIN},RATE_LIMIT_DEFAULT_PER_MIN=${_RATE_LIMIT_DEFAULT_PER_MIN}
       - --set-secrets
       - ${_SECRETS}
 
@@ -80,8 +81,23 @@ substitutions:
   _ANON_IP_DAILY_LIMIT: '20'
   # Anonymous chat questions per day, all visitors together (0 = off)
   _ANON_GLOBAL_DAILY_LIMIT: '1000'
-  # ENV_VAR=secret-name:version pairs from Secret Manager (see docs/deployment-gcp.md)
-  _SECRETS: DATABASE_URL=database-url:latest,JWT_SECRET=jwt-secret:latest,GEMINI_API_KEY=gemini-api-key:latest,GROQ_API_KEY=groq-api-key:latest
+  # Chat emergency switch: on | signed_in_only | off (docs/deployment-gcp.md §6)
+  _CHAT_MODE: 'on'
+  # Signed-in chat questions per day, all users together (0 = off)
+  _SIGNED_IN_GLOBAL_DAILY_LIMIT: '1000'
+  # Firebase sign-in methods that may log in, separated by SPACES (commas would split --set-env-vars).
+  # Read docs/auth-providers.md before adding one. Never "anonymous".
+  _AUTH_ALLOWED_PROVIDERS: 'google.com'
+  # Per-minute rate limits per visitor IP (0 = off for that group). "shadow" only logs what
+  # would be rejected; switch to "enforce" after reviewing the logs (docs/deployment-gcp.md §6).
+  _RATE_LIMIT_MODE: 'shadow'
+  _RATE_LIMIT_CHAT_PER_MIN: '10'
+  _RATE_LIMIT_SEARCH_PER_MIN: '60'
+  _RATE_LIMIT_LOGIN_PER_MIN: '20'
+  _RATE_LIMIT_DEFAULT_PER_MIN: '120'
+  # ENV_VAR=secret-name:version pairs from Secret Manager (see docs/deployment-gcp.md).
+  # TRUSTED_RELAY_SECRETS: the secret(s) the Next.js server sends in X-Relay-Secret (§6). Create it before deploying.
+  _SECRETS: DATABASE_URL=database-url:latest,JWT_SECRET=jwt-secret:latest,GEMINI_API_KEY=gemini-api-key:latest,GROQ_API_KEY=groq-api-key:latest,TRUSTED_RELAY_SECRETS=trusted-relay-secrets:latest
 
 options:
   machineType: 'E2_HIGHCPU_8'

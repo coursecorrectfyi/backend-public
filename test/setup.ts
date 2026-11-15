@@ -11,6 +11,10 @@
  *   @hono/node-server        -> serve() captures the fetch handler and never binds a port
  *   dotenv/config            -> no-op, so a developer's .env never leaks into tests
  *   global fetch             -> throws, so any un-faked network call fails loudly
+ *
+ * In-memory per-instance state (rate-limit buckets, log windows) is cleared
+ * before each test, like the database, so one test's requests can't push the
+ * next one over a limit.
  */
 import { afterEach, beforeEach, vi } from 'vitest'
 import { resetEmbeddingFake } from './fakes/embedding.js'
@@ -27,7 +31,12 @@ vi.mock('firebase-admin/auth', () => import('./fakes/firebase.js'))
 
 const SHOW_LOGS = process.env.TEST_LOGS === '1'
 
-beforeEach(() => {
+beforeEach(async () => {
+  // Imported here, not at the top: after vi.resetModules() (loadFreshApp) this
+  // is the registry of the app instance the test is using.
+  const { resetInstanceState } = await import('../src/lib/instance-state.js')
+  resetInstanceState()
+
   resetEmbeddingFake()
   resetGenaiFake()
   resetFirebaseFake()
@@ -36,12 +45,14 @@ beforeEach(() => {
     throw new Error(`Unexpected network call in tests: ${String(input)}`)
   }))
 
-  // The app logs expected failures (bad tokens, simulated outages) with
-  // console.error. Keep test output readable; tests can still assert on these
+  // The app logs expected failures (bad tokens, simulated outages) and events
+  // (structured JSON lines on stdout, src/lib/logger.ts). Keep test output
+  // readable; tests can still assert on them with captureLogs() or the console
   // spies. Run with TEST_LOGS=1 to see the output.
   if (!SHOW_LOGS) {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
   }
 })
 

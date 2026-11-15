@@ -24,7 +24,7 @@
  * so counting single addresses would let one client rotate through billions.
  */
 
-import { isIP } from 'node:net'
+import { BlockList, isIP } from 'node:net'
 import type { Context } from 'hono'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import { readNonNegativeIntEnv } from './env.js'
@@ -53,13 +53,20 @@ function ipv6Groups(address: string): number[] {
   return [...left, ...zeros, ...right]
 }
 
+interface ParsedAddress {
+  /** IPv4 dotted form (IPv4-mapped IPv6 is converted), or lowercase IPv6 */
+  address: string
+  family: 'ipv4' | 'ipv6'
+  /** The 8 groups, for IPv6 only */
+  groups?: number[]
+}
+
 /**
- * Turns one address (as found in X-Forwarded-For or on the socket) into the
- * key limits are counted under: the IPv4 address itself, or the IPv6 /64
- * prefix ("2001:db8:1:2::/64"). IPv4-mapped IPv6 (::ffff:192.0.2.4) counts as
- * IPv4. Returns null for anything that isn't an IP address.
+ * Parses one address as found in X-Forwarded-For or on the socket: strips
+ * brackets, a port and an IPv6 zone id. IPv4-mapped IPv6 (::ffff:192.0.2.4)
+ * counts as IPv4. Returns null for anything that isn't an IP address.
  */
-export function clientKeyFromAddress(raw: string): string | null {
+function parseAddress(raw: string): ParsedAddress | null {
   let address = raw.trim()
   const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(address) // [v6] or [v6]:port
   if (bracketed) address = bracketed[1]!
@@ -68,42 +75,104 @@ export function clientKeyFromAddress(raw: string): string | null {
   address = address.replace(/%.*$/, '') // IPv6 zone id (fe80::1%eth0)
 
   const version = isIP(address)
-  if (version === 4) return address
+  if (version === 4) return { address, family: 'ipv4' }
   if (version !== 6) return null
 
-  const groups = ipv6Groups(address.toLowerCase())
+  address = address.toLowerCase()
+  const groups = ipv6Groups(address)
   const isV4Mapped = groups.slice(0, 5).every(g => g === 0) && groups[5] === 0xffff
   if (isV4Mapped) {
-    return [groups[6]! >> 8, groups[6]! & 0xff, groups[7]! >> 8, groups[7]! & 0xff].join('.')
+    const v4 = [groups[6]! >> 8, groups[6]! & 0xff, groups[7]! >> 8, groups[7]! & 0xff].join('.')
+    return { address: v4, family: 'ipv4' }
   }
-  return `${groups.slice(0, 4).map(g => g.toString(16)).join(':')}::/64`
+  return { address, family: 'ipv6', groups }
+}
+
+/**
+ * Turns one address (as found in X-Forwarded-For or on the socket) into the
+ * key limits are counted under: the IPv4 address itself, or the IPv6 /64
+ * prefix ("2001:db8:1:2::/64"). IPv4-mapped IPv6 (::ffff:192.0.2.4) counts as
+ * IPv4. Returns null for anything that isn't an IP address.
+ */
+export function clientKeyFromAddress(raw: string): string | null {
+  const parsed = parseAddress(raw)
+  if (!parsed) return null
+  if (parsed.family === 'ipv4') return parsed.address
+  return `${parsed.groups!.slice(0, 4).map(g => g.toString(16)).join(':')}::/64`
+}
+
+/**
+ * Addresses a visitor's request can't come from on the public internet:
+ * private networks, loopback, link-local (Cloud Run's front end connects from
+ * 169.254.x.x), carrier-grade NAT and "this network".
+ */
+const NON_PUBLIC = new BlockList()
+for (const [net, prefix] of [
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
+  ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.168.0.0', 16],
+] as const) NON_PUBLIC.addSubnet(net, prefix, 'ipv4')
+for (const [net, prefix] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10]] as const) {
+  NON_PUBLIC.addSubnet(net, prefix, 'ipv6')
+}
+
+/**
+ * True if `raw` is a private, loopback or link-local address. Picking one as
+ * the client means a proxy's own address was used: TRUST_PROXY_HOPS is too low.
+ */
+export function isNonPublicAddress(raw: string): boolean {
+  const parsed = parseAddress(raw)
+  return parsed !== null && NON_PUBLIC.check(parsed.address, parsed.family)
+}
+
+/** What the proxy chain of one request looks like (see clientKeyFromChain). */
+export interface ChainInfo {
+  /** Number of X-Forwarded-For entries. Browsers send none, so normally one per proxy. */
+  forwardedCount: number
+  /** The address TRUST_PROXY_HOPS points at, before parsing. */
+  picked: string | undefined
+}
+
+/**
+ * Builds the chain [...X-Forwarded-For entries, socket address] and picks the
+ * address `hops` places from the right. `socketAddress` is undefined when
+ * the runtime doesn't expose it; it still counts as the last hop.
+ */
+export function inspectChain(
+  forwardedFor: string | undefined,
+  socketAddress: string | undefined,
+  hops: number,
+): ChainInfo {
+  const forwarded = (forwardedFor ?? '').split(',').map(s => s.trim()).filter(Boolean)
+  const chain: Array<string | undefined> = [...forwarded, socketAddress]
+  // More hops than addresses: the request didn't pass through all the proxies
+  // we expect; the furthest address is the best we have (as Express does).
+  return { forwardedCount: forwarded.length, picked: chain[Math.max(0, chain.length - 1 - hops)] }
 }
 
 /**
  * Picks the client address from the X-Forwarded-For header value and the
- * socket address, trusting `hops` proxies. `socketAddress` is undefined when
- * the runtime doesn't expose it; it still counts as the last hop.
+ * socket address, trusting `hops` proxies, and returns its client key.
  */
 export function clientKeyFromChain(
   forwardedFor: string | undefined,
   socketAddress: string | undefined,
   hops: number,
 ): string | null {
-  const forwarded = (forwardedFor ?? '').split(',').map(s => s.trim()).filter(Boolean)
-  const chain: Array<string | undefined> = [...forwarded, socketAddress]
-  // More hops than addresses: the request didn't pass through all the proxies
-  // we expect; the furthest address is the best we have (as Express does).
-  const picked = chain[Math.max(0, chain.length - 1 - hops)]
+  const { picked } = inspectChain(forwardedFor, socketAddress, hops)
   return picked === undefined ? null : clientKeyFromAddress(picked)
+}
+
+/** The socket (TCP peer) address, or undefined if the runtime doesn't expose it. */
+export function socketAddress(c: Context): string | undefined {
+  try {
+    return getConnInfo(c).remote.address
+  } catch {
+    // Not running on @hono/node-server (or no socket): treated as unknown.
+    return undefined
+  }
 }
 
 /** The client key for a request (see clientKeyFromChain), or null if unknown. */
 export function clientKey(c: Context, hops: number): string | null {
-  let socketAddress: string | undefined
-  try {
-    socketAddress = getConnInfo(c).remote.address
-  } catch {
-    // Not running on @hono/node-server (or no socket): treated as unknown.
-  }
-  return clientKeyFromChain(c.req.header('X-Forwarded-For'), socketAddress, hops)
+  return clientKeyFromChain(c.req.header('X-Forwarded-For'), socketAddress(c), hops)
 }

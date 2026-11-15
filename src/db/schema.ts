@@ -428,12 +428,14 @@ export type ChatUsageIdentityType = 'user' | 'anon' | 'ip' | 'global'
  *   'ip'     'ip:<HMAC of date + client IP>' shared by all anonymous
  *            sessions from one IP (IPv6: one /64). Never a raw IP   (ANON_IP_DAILY_LIMIT)
  *   'global' 'global:anon', all anonymous questions together       (ANON_GLOBAL_DAILY_LIMIT)
+ *            'global:signed_in', all signed-in questions together  (SIGNED_IN_GLOBAL_DAILY_LIMIT)
  *
  * Analytics: count people with identity_type IN ('user', 'anon') only; 'ip'
- * and 'global' rows are extra counters for the same questions.
+ * and 'global' rows are extra counters for the same questions. Rows are kept
+ * 7 days (retention job); daily totals stay in chat_usage_daily.
  */
 export const chat_usage = pgTable('chat_usage', {
-  /** See the table comment: Firebase UID, session UUID, 'ip:<hash>' or 'global:anon' */
+  /** See the table comment: Firebase UID, session UUID, 'ip:<hash>', 'global:anon' or 'global:signed_in' */
   identity: text('identity').notNull(),
   /** 'user' | 'anon' | 'ip' | 'global' (see the table comment) */
   identity_type: text('identity_type').$type<ChatUsageIdentityType>().notNull(),
@@ -444,6 +446,25 @@ export const chat_usage = pgTable('chat_usage', {
 }, (table) => [
   primaryKey({ columns: [table.identity, table.query_date] }),
   index('chat_usage_date_idx').on(table.query_date),
+])
+
+/**
+ * Daily totals kept after chat_usage rows are deleted (retention job,
+ * src/lib/chat-usage-retention.ts). Counts only: no identities, no hashes.
+ *
+ * One row per (date, identity_type):
+ *   'user'  identities = signed-in users who asked,      questions = their questions
+ *   'anon'  identities = anonymous sessions that asked,  questions = their questions
+ *   'ip'    identities = networks anonymous questions came from (distinct IPs / IPv6 /64s),
+ *           questions = the same anonymous questions again: never add them to 'anon'
+ */
+export const chat_usage_daily = pgTable('chat_usage_daily', {
+  query_date: date('query_date').notNull(),
+  identity_type: text('identity_type').$type<'user' | 'anon' | 'ip'>().notNull(),
+  identities: integer('identities').notNull(),
+  questions: integer('questions').notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.query_date, table.identity_type] }),
 ])
 
 // ─── Saved courses ────────────────────────────────────────────────────────────

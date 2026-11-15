@@ -3,9 +3,39 @@ import { sql, and, eq, inArray, desc, asc } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { learning_resources } from '../db/schema.js'
 import { embedQuery } from '../lib/embedding/vertex.js'
+import { QueryEmbeddingCache } from '../lib/embedding/query-cache.js'
+import { registerInstanceState } from '../lib/instance-state.js'
+import { isUuid } from '../lib/ids.js'
+import { logError } from '../lib/logger.js'
+import { collapseWhitespace, truncateAtWord } from '../lib/text.js'
 import { matchResourceId } from './resource-ids.js'
 
 export const resourcesRouter = new Hono()
+
+// ─── Search input limits (docs/api.md) ────────────────────────────────────────
+//
+// Every search can call the paid embedding API and runs a ranking query, so
+// all input is bounded and checked before either happens.
+
+export const SEARCH_LIMITS = {
+  /** `q` is cut to this length (after collapsing whitespace, at a word boundary), quietly: D12. */
+  queryMaxChars: 200,
+  /** Values per filter parameter (e.g. ?provider=a&provider=b). More gets 400. */
+  filterMaxValues: 20,
+  /** Length of one filter value. Longer gets 400. */
+  filterValueMaxChars: 50,
+  /** Length of `cursor`. Real cursors are far shorter. Longer gets 400. */
+  cursorMaxChars: 1_000,
+} as const
+
+export const LEVELS = ['beginner', 'intermediate', 'advanced', 'all_levels'] as const
+export const RESOURCE_TYPES = ['course', 'program', 'degree', 'project', 'certification', 'code_along'] as const
+const SORT_KEYS = ['relevance', 'rating', 'most_reviewed', 'duration_asc', 'duration_desc', 'newest'] as const
+
+// Per-instance cache of query embeddings (see query-cache.ts): page 2, 3, ...
+// of a search reuse page 1's embedding instead of calling the API again.
+const queryEmbeddings = new QueryEmbeddingCache(embedQuery)
+registerInstanceState(() => queryEmbeddings.clear())
 
 // ─── Cursor helpers ───────────────────────────────────────────────────────────
 //
@@ -15,7 +45,7 @@ export const resourcesRouter = new Hono()
 //
 // Encoding: JSON → base64url (URL-safe, no padding issues in query strings)
 
-type SortKey = 'relevance' | 'rating' | 'most_reviewed' | 'duration_asc' | 'duration_desc' | 'newest'
+type SortKey = typeof SORT_KEYS[number]
 
 interface CursorPayload {
   sort: SortKey
@@ -31,11 +61,46 @@ function encodeCursor(payload: CursorPayload): string {
   return Buffer.from(JSON.stringify(payload)).toString('base64url')
 }
 
-function decodeCursor(token: string): CursorPayload | null {
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/
+const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
+
+/**
+ * Decodes and fully validates a cursor for the given sort, or returns null.
+ * Everything in it ends up in SQL, so a made-up cursor must be refused here
+ * (400) rather than fail in Postgres (500) or page through the wrong order.
+ */
+function parseCursor(token: string, sort: SortKey): CursorPayload | null {
+  if (token.length > SEARCH_LIMITS.cursorMaxChars) return null
+  let raw: unknown
   try {
-    return JSON.parse(Buffer.from(token, 'base64url').toString()) as CursorPayload
+    raw = JSON.parse(Buffer.from(token, 'base64url').toString())
   } catch {
     return null
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const c = raw as Record<string, unknown>
+  // A cursor only continues the sort it was made for.
+  if (c['sort'] !== sort || typeof c['id'] !== 'string' || !isUuid(c['id'])) return null
+
+  const nullOr = (check: (v: unknown) => boolean) => (v: unknown) => v === null || check(v)
+  switch (sort) {
+    case 'relevance':
+      return isFiniteNumber(c['score']) ? { sort, id: c['id'], score: c['score'] } : null
+    case 'rating':
+      return nullOr(isFiniteNumber)(c['rating'])
+        ? { sort, id: c['id'], rating: c['rating'] as number | null } : null
+    case 'most_reviewed':
+      return nullOr(Number.isSafeInteger)(c['num_ratings'])
+        ? { sort, id: c['id'], num_ratings: c['num_ratings'] as number | null } : null
+    case 'duration_asc':
+    case 'duration_desc':
+      return nullOr(isFiniteNumber)(c['duration_hours'])
+        ? { sort, id: c['id'], duration_hours: c['duration_hours'] as number | null } : null
+    case 'newest': {
+      const at = c['created_at']
+      return typeof at === 'string' && ISO_TIMESTAMP.test(at) && !Number.isNaN(Date.parse(at))
+        ? { sort, id: c['id'], created_at: at } : null
+    }
   }
 }
 
@@ -129,8 +194,8 @@ function buildNextCursor(sort: SortKey, row: {
 
 // ─── Search endpoint ──────────────────────────────────────────────────────────
 //
-// Query params:
-//   q              required — plain-text search query
+// Query params (limits and errors: SEARCH_LIMITS above, docs/api.md):
+//   q              required — plain-text search query, cut to 200 characters
 //   cursor         opaque pagination token from previous response (omit for first page)
 //   limit          default 20, max 50
 //   sort           relevance (default) | rating | most_reviewed | duration_asc | duration_desc | newest
@@ -141,29 +206,77 @@ function buildNextCursor(sort: SortKey, row: {
 //   is_free        true | false
 //   has_certificate true | false
 
+/**
+ * Reads one repeatable filter parameter: empty values are dropped; too many
+ * values, values that are too long or (with `allowed`) unknown values give a
+ * 400 body. A filter decides which results come back, so a value the API
+ * can't use is refused rather than ignored (ignoring it would return results
+ * the client didn't ask for).
+ */
+function readFilter(
+  values: string[] | undefined,
+  name: string,
+  allowed?: readonly string[],
+): { ok: true; values: string[] } | { ok: false; error: Record<string, unknown> } {
+  const list = (values ?? []).map(v => v.trim()).filter(Boolean)
+  if (list.length > SEARCH_LIMITS.filterMaxValues) {
+    return { ok: false, error: { error: `Too many ${name} values`, maxValues: SEARCH_LIMITS.filterMaxValues } }
+  }
+  if (list.some(v => v.length > SEARCH_LIMITS.filterValueMaxChars)) {
+    return { ok: false, error: { error: `A ${name} value is too long`, maxLength: SEARCH_LIMITS.filterValueMaxChars } }
+  }
+  const unknown = allowed ? list.find(v => !allowed.includes(v)) : undefined
+  if (unknown !== undefined) {
+    return { ok: false, error: { error: `Invalid ${name}: "${unknown}"`, allowed } }
+  }
+  return { ok: true, values: list }
+}
+
 resourcesRouter.get('/search', async (c) => {
-  const q = c.req.query('q')?.trim()
+  // ── Input: everything is checked before any paid or heavy work ──────────
+  // D12: an over-long query is cut quietly, not refused: a pasted paragraph
+  // or an old shared link still searches, and the same long query always
+  // becomes the same text, so its cursors keep working.
+  const q = truncateAtWord(collapseWhitespace(c.req.query('q') ?? ''), SEARCH_LIMITS.queryMaxChars)
   if (!q) {
     return c.json({ error: 'Missing required query parameter: q' }, 400)
   }
 
   const parsedLimit = parseInt(c.req.query('limit') ?? '', 10)
   const limit      = Number.isNaN(parsedLimit) ? 20 : Math.min(50, Math.max(1, parsedLimit))
-  const cursorToken = c.req.query('cursor') ?? null
-  const sort       = (c.req.query('sort') ?? 'relevance') as SortKey
+  const requestedSort = c.req.query('sort')
+  const sort: SortKey = SORT_KEYS.find(k => k === requestedSort) ?? 'relevance'
 
-  const levels         = c.req.queries('level')         ?? []
-  const providers      = c.req.queries('provider')      ?? []
-  const languages      = c.req.queries('language')      ?? []
-  const resource_types = c.req.queries('resource_type') ?? []
+  const level = readFilter(c.req.queries('level'), 'level', LEVELS)
+  if (!level.ok) return c.json(level.error, 400)
+  const provider = readFilter(c.req.queries('provider'), 'provider')
+  if (!provider.ok) return c.json(provider.error, 400)
+  const language = readFilter(c.req.queries('language'), 'language')
+  if (!language.ok) return c.json(language.error, 400)
+  const resourceType = readFilter(c.req.queries('resource_type'), 'resource_type', RESOURCE_TYPES)
+  if (!resourceType.ok) return c.json(resourceType.error, 400)
+  const [levels, providers, languages, resource_types] =
+    [level.values, provider.values, language.values, resourceType.values]
   const is_free        = c.req.query('is_free')
   const has_cert       = c.req.query('has_certificate')
 
-  let queryVector: number[] | null = null
-  try {
-    queryVector = await embedQuery(q)
-  } catch {
-    // fall through — keyword-only search
+  const cursorToken = c.req.query('cursor')
+  let cursor: CursorPayload | null = null
+  if (cursorToken) {
+    cursor = parseCursor(cursorToken, sort)
+    if (!cursor) return c.json({ error: 'Invalid cursor' }, 400)
+  }
+
+  // ── Embedding: only relevance ranking uses it ────────────────────────────
+  let queryVector: Float32Array | null = null
+  if (sort === 'relevance') {
+    try {
+      queryVector = await queryEmbeddings.get(q)
+    } catch (err) {
+      // Keyword-only search instead (vector_search: false). Logged so an
+      // embedding outage or timeouts show up in Error Reporting.
+      logError('search_embedding_failed', err)
+    }
   }
 
   const tsQuery = sql`plainto_tsquery('english', ${q})`
@@ -189,10 +302,7 @@ resourcesRouter.get('/search', async (c) => {
     ...(has_cert === 'true' || has_cert === 'false' ? [eq(learning_resources.has_certificate, has_cert === 'true')] : []),
   ]
 
-  if (cursorToken) {
-    const cursor = decodeCursor(cursorToken)
-    if (cursor) conditions.push(buildCursorCondition(cursor, relevanceScore))
-  }
+  if (cursor) conditions.push(buildCursorCondition(cursor, relevanceScore))
 
   const rows = await db
     .select({

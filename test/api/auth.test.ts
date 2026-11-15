@@ -1,11 +1,12 @@
 /** src/api/auth.ts: Firebase login, token refresh, logout. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { verify } from 'hono/jwt'
-import { loadApp } from '../helpers/app.js'
+import { loadApp, loadFreshApp, type TestClient } from '../helpers/app.js'
 import { accessToken, bearer, mintToken, refreshToken } from '../helpers/auth.js'
 import { resetDb } from '../fakes/db.js'
 import { allUsers } from '../helpers/fixtures.js'
 import { applicationDefault, initializeApp, registerIdToken, verifyIdToken } from '../fakes/firebase.js'
+import { captureLogs } from '../helpers/logs.js'
 
 beforeEach(resetDb)
 
@@ -137,6 +138,104 @@ describe('POST /api/v1/auth/firebase/login', () => {
     vi.stubEnv('JWT_SECRET', undefined)
     const res = await app.post(LOGIN, { idToken: 'tok' })
     expect(res.status).toBe(500)
+  })
+})
+
+describe('sign-in methods (AUTH_ALLOWED_PROVIDERS, docs/auth-providers.md)', () => {
+  async function appAllowing(providers?: string): Promise<TestClient> {
+    vi.stubEnv('AUTH_ALLOWED_PROVIDERS', providers)
+    return loadFreshApp()
+  }
+  const loginEvents = (logs: Array<Record<string, unknown>>) =>
+    logs.filter(l => l.event === 'login_rejected' || l.event === 'user_signed_up')
+
+  it('allows Google by default and reports provider "google"', async () => {
+    const app = await appAllowing(undefined)
+    registerIdToken('tok', { uid: 'u', firebase: { sign_in_provider: 'google.com' } })
+    const res = await app.post(LOGIN, { idToken: 'tok' })
+    expect(res.status).toBe(200)
+    expect((await res.json()).user.provider).toBe('google')
+  })
+
+  it.each([
+    ['GitHub', 'github.com'],
+    ['email/password', 'password'],
+    ['an anonymous Firebase account', 'anonymous'],
+    ['phone', 'phone'],
+  ])('refuses %s by default with 403, without creating a user or issuing tokens', async (_label, providerId) => {
+    const app = await appAllowing(undefined)
+    const logs = captureLogs()
+    registerIdToken('tok', { uid: 'u', email: 'u@example.com', firebase: { sign_in_provider: providerId } })
+    const res = await app.post(LOGIN, { idToken: 'tok' })
+    expect(res.status).toBe(403)
+    expect(await res.json()).toEqual({ error: 'This sign-in method is not supported', code: 'provider_not_allowed' })
+    expect(await allUsers()).toHaveLength(0)
+    expect(loginEvents(logs())).toEqual([
+      expect.objectContaining({ event: 'login_rejected', reason: 'provider_not_allowed', provider: providerId }),
+    ])
+  })
+
+  it('refuses a token without a sign-in method', async () => {
+    const app = await appAllowing(undefined)
+    const logs = captureLogs()
+    registerIdToken('tok', { uid: 'u', firebase: {} })
+    expect((await app.post(LOGIN, { idToken: 'tok' })).status).toBe(403)
+    expect(loginEvents(logs())).toEqual([expect.objectContaining({ reason: 'provider_not_allowed', provider: null })])
+  })
+
+  it('allows a provider once it is listed, with its own name, and without name or email claims', async () => {
+    const app = await appAllowing('google.com github.com')
+    registerIdToken('tok', { uid: 'gh-user', firebase: { sign_in_provider: 'github.com' }, email_verified: false })
+    const res = await app.post(LOGIN, { idToken: 'tok' })
+    expect(res.status).toBe(200)
+    expect((await res.json()).user).toMatchObject({ id: 'gh-user', provider: 'github', email: null, firstName: null })
+  })
+
+  describe('email/password', () => {
+    it('refuses an unverified email with 403 email_not_verified, without creating a user', async () => {
+      const app = await appAllowing('google.com,password')
+      const logs = captureLogs()
+      registerIdToken('tok', {
+        uid: 'pw-user', email: 'made-up@example.com', email_verified: false, firebase: { sign_in_provider: 'password' },
+      })
+      const res = await app.post(LOGIN, { idToken: 'tok' })
+      expect(res.status).toBe(403)
+      expect(await res.json()).toEqual({ error: 'Verify your email address before signing in', code: 'email_not_verified' })
+      expect(await allUsers()).toHaveLength(0)
+      expect(loginEvents(logs())).toEqual([
+        expect.objectContaining({ event: 'login_rejected', reason: 'email_not_verified', provider: 'password' }),
+      ])
+    })
+
+    it('allows a verified email and reports provider "email"', async () => {
+      const app = await appAllowing('google.com,password')
+      registerIdToken('tok', {
+        uid: 'pw-user', email: 'real@example.com', email_verified: true, firebase: { sign_in_provider: 'password' },
+      })
+      const res = await app.post(LOGIN, { idToken: 'tok' })
+      expect(res.status).toBe(200)
+      expect((await res.json()).user).toMatchObject({ id: 'pw-user', provider: 'email', email: 'real@example.com' })
+    })
+  })
+
+  it('logs user_signed_up (with the provider, without any identity) for a new account only', async () => {
+    const app = await appAllowing(undefined)
+    const logs = captureLogs()
+    registerIdToken('tok', { uid: 'fb-uid-1', email: 'ada@example.com' })
+    await app.post(LOGIN, { idToken: 'tok' })
+    await app.post(LOGIN, { idToken: 'tok' })
+    const events = loginEvents(logs())
+    expect(events).toEqual([
+      { event: 'user_signed_up', provider: 'google.com', level: 'info', severity: 'INFO', ts: expect.any(String) },
+    ])
+    expect(JSON.stringify(events)).not.toMatch(/fb-uid-1|ada@/)
+  })
+
+  it.each([
+    ['google', 'AUTH_ALLOWED_PROVIDERS: unknown provider "google"'],
+    ['google.com anonymous', 'AUTH_ALLOWED_PROVIDERS must not include "anonymous"'],
+  ])('stops the app from starting when AUTH_ALLOWED_PROVIDERS is %j', async (value, message) => {
+    await expect(appAllowing(value)).rejects.toThrow(message)
   })
 })
 

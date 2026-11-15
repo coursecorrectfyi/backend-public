@@ -48,7 +48,15 @@ let cached: TestClient | undefined
 export async function loadApp(): Promise<TestClient> {
   if (cached) return cached
   serve.mockClear()
-  await import('../../src/index.js')
+  try {
+    await import('../../src/index.js')
+  } catch (err) {
+    // Startup failed (e.g. a test set an invalid env var on purpose). The
+    // failed import stays in the module cache, so forget it: otherwise the
+    // next loadApp() in this file would get the same error back.
+    vi.resetModules()
+    throw err
+  }
   const options = serve.mock.lastCall?.[0]
   if (!options) throw new Error('src/index.ts did not call serve()')
   cached = createClient(options.fetch)

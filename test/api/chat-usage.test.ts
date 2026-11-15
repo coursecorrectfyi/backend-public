@@ -8,8 +8,9 @@ import { db, resetDb } from '../fakes/db.js'
 import { chatUsageToday } from '../helpers/fixtures.js'
 import { chat_usage } from '../../src/db/schema.js'
 import {
-  DEFAULT_ANON_GLOBAL_DAILY_LIMIT, DEFAULT_ANON_IP_DAILY_LIMIT, GLOBAL_ANON_IDENTITY, LIMIT_ANONYMOUS, LIMIT_SIGNED_IN,
-  checkAndIncrementUsage, ipIdentity, readAnonLimits, refundUsage, secondsUntilUtcMidnight, usageCounters, utcDate,
+  DEFAULT_ANON_GLOBAL_DAILY_LIMIT, DEFAULT_ANON_IP_DAILY_LIMIT, DEFAULT_SIGNED_IN_GLOBAL_DAILY_LIMIT, GLOBAL_ANON_IDENTITY,
+  GLOBAL_SIGNED_IN_IDENTITY, LIMIT_ANONYMOUS, LIMIT_SIGNED_IN,
+  checkAndIncrementUsage, ipIdentity, readChatLimits, refundUsage, secondsUntilUtcMidnight, usageCounters, utcDate,
   type UsageCounter,
 } from '../../src/api/chat-usage.js'
 
@@ -17,26 +18,30 @@ beforeEach(resetDb)
 
 const SECRET = 'test-secret'
 const SESSION_ID = '3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a60'
-const limits = { ipDailyLimit: 20, globalDailyLimit: 1000 }
+const limits = { ipDailyLimit: 20, globalDailyLimit: 1000, signedInGlobalDailyLimit: 1000 }
 
 describe('limits', () => {
   it('keeps the documented values', () => {
-    expect([LIMIT_SIGNED_IN, LIMIT_ANONYMOUS, DEFAULT_ANON_IP_DAILY_LIMIT, DEFAULT_ANON_GLOBAL_DAILY_LIMIT])
-      .toEqual([10, 5, 20, 1000])
+    expect([
+      LIMIT_SIGNED_IN, LIMIT_ANONYMOUS, DEFAULT_ANON_IP_DAILY_LIMIT, DEFAULT_ANON_GLOBAL_DAILY_LIMIT,
+      DEFAULT_SIGNED_IN_GLOBAL_DAILY_LIMIT,
+    ]).toEqual([10, 5, 20, 1000, 1000])
   })
 
-  it('reads ANON_IP_DAILY_LIMIT and ANON_GLOBAL_DAILY_LIMIT, with defaults', () => {
+  it('reads ANON_IP_DAILY_LIMIT, ANON_GLOBAL_DAILY_LIMIT and SIGNED_IN_GLOBAL_DAILY_LIMIT, with defaults', () => {
     vi.stubEnv('ANON_IP_DAILY_LIMIT', undefined)
     vi.stubEnv('ANON_GLOBAL_DAILY_LIMIT', undefined)
-    expect(readAnonLimits()).toEqual({ ipDailyLimit: 20, globalDailyLimit: 1000 })
+    vi.stubEnv('SIGNED_IN_GLOBAL_DAILY_LIMIT', undefined)
+    expect(readChatLimits()).toEqual({ ipDailyLimit: 20, globalDailyLimit: 1000, signedInGlobalDailyLimit: 1000 })
     vi.stubEnv('ANON_IP_DAILY_LIMIT', '0')
     vi.stubEnv('ANON_GLOBAL_DAILY_LIMIT', '50000')
-    expect(readAnonLimits()).toEqual({ ipDailyLimit: 0, globalDailyLimit: 50000 })
+    vi.stubEnv('SIGNED_IN_GLOBAL_DAILY_LIMIT', '7')
+    expect(readChatLimits()).toEqual({ ipDailyLimit: 0, globalDailyLimit: 50000, signedInGlobalDailyLimit: 7 })
   })
 
-  it('rejects invalid values', () => {
-    vi.stubEnv('ANON_GLOBAL_DAILY_LIMIT', '-5')
-    expect(() => readAnonLimits()).toThrow('ANON_GLOBAL_DAILY_LIMIT must be a non-negative integer')
+  it.each(['ANON_GLOBAL_DAILY_LIMIT', 'SIGNED_IN_GLOBAL_DAILY_LIMIT'])('rejects invalid values of %s', name => {
+    vi.stubEnv(name, '-5')
+    expect(() => readChatLimits()).toThrow(`${name} must be a non-negative integer`)
   })
 })
 
@@ -77,10 +82,20 @@ describe('dates', () => {
 describe('usageCounters', () => {
   const now = new Date('2026-01-15T10:00:00Z')
 
-  it('signed-in users have only their own counter', () => {
+  it('signed-in questions count against the user and the signed-in total, in that order, never the IP', () => {
     expect(usageCounters({ kind: 'user', identity: 'fb-1' }, '203.0.113.7', limits, SECRET, now)).toEqual([
       { scope: 'user', identity: 'fb-1', identityType: 'user', limit: 10 },
+      { scope: 'signed_in_global', identity: GLOBAL_SIGNED_IN_IDENTITY, identityType: 'global', limit: 1000 },
     ])
+  })
+
+  it('skips the signed-in total when its limit is 0', () => {
+    expect(usageCounters({ kind: 'user', identity: 'fb-1' }, null, { ...limits, signedInGlobalDailyLimit: 0 }, SECRET, now))
+      .toEqual([{ scope: 'user', identity: 'fb-1', identityType: 'user', limit: 10 }])
+  })
+
+  it('keeps the anonymous and signed-in totals apart', () => {
+    expect(GLOBAL_ANON_IDENTITY).not.toBe(GLOBAL_SIGNED_IN_IDENTITY)
   })
 
   it('anonymous questions count against the session, the IP and the global counter, in that order', () => {

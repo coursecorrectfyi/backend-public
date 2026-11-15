@@ -4,14 +4,18 @@
  * Every question is counted against one or more counters in chat_usage:
  *
  *   signed-in user   'user'    Firebase UID                      10/day
+ *                    'global'  all signed-in questions           SIGNED_IN_GLOBAL_DAILY_LIMIT (default 1000, 0 = off)
  *   anonymous        'anon'    X-Session-ID (UUID)                5/day
  *                    'ip'      all anonymous sessions from the
  *                              client's IP (IPv6: /64)           ANON_IP_DAILY_LIMIT     (default 20, 0 = off)
  *                    'global'  all anonymous questions           ANON_GLOBAL_DAILY_LIMIT (default 1000, 0 = off)
  *
  * A question is answered only if every counter is under its limit. Signed-in
- * users only have their own counter: they are authenticated, and the IP and
- * global caps exist to stop anonymous session-id rotation.
+ * users have no IP counter: they are authenticated, and the IP cap exists to
+ * stop anonymous session-id rotation. Each group has its own total, so a flood
+ * of anonymous questions can't use up signed-in users' capacity, and the
+ * signed-in total is a ceiling in case accounts turn out cheap to create
+ * (see docs/auth-providers.md).
  *
  * Hold, then release: a question is counted when it arrives and given back
  * (refundUsage) if Gemini fails before sending any text. Requests over a limit
@@ -22,7 +26,7 @@
  * and all of a question's counters are updated in one transaction that is
  * rolled back if any of them is full. Simultaneous requests therefore queue up
  * and can't slip past a limit. Counters are always taken in the same order
- * (own, ip, global), so two transactions can't deadlock.
+ * (own, ip, total), so two transactions can't deadlock.
  *
  * Limits are per UTC day: query_date is the database's CURRENT_DATE, so the
  * Cloud SQL instance must use UTC (its default).
@@ -38,27 +42,39 @@ export const LIMIT_SIGNED_IN = 10
 export const LIMIT_ANONYMOUS = 5
 export const DEFAULT_ANON_IP_DAILY_LIMIT = 20
 export const DEFAULT_ANON_GLOBAL_DAILY_LIMIT = 1000
+export const DEFAULT_SIGNED_IN_GLOBAL_DAILY_LIMIT = 1000
 
-/** The identity shared by all anonymous questions (the global counter). */
+/** The identity shared by all anonymous questions (the anonymous total). */
 export const GLOBAL_ANON_IDENTITY = 'global:anon'
+/** The identity shared by all signed-in questions (the signed-in total). */
+export const GLOBAL_SIGNED_IN_IDENTITY = 'global:signed_in'
 
-export interface AnonLimits {
+export interface ChatLimits {
   /** Anonymous questions per client IP per day, across all sessions. 0 = off. */
   ipDailyLimit: number
   /** Anonymous questions per day in total. 0 = off. */
   globalDailyLimit: number
+  /** Signed-in questions per day in total. 0 = off. */
+  signedInGlobalDailyLimit: number
 }
 
-/** Reads ANON_IP_DAILY_LIMIT and ANON_GLOBAL_DAILY_LIMIT. Throws on invalid values. */
-export function readAnonLimits(): AnonLimits {
+/**
+ * Reads ANON_IP_DAILY_LIMIT, ANON_GLOBAL_DAILY_LIMIT and
+ * SIGNED_IN_GLOBAL_DAILY_LIMIT. Throws on invalid values.
+ */
+export function readChatLimits(): ChatLimits {
   return {
     ipDailyLimit: readNonNegativeIntEnv('ANON_IP_DAILY_LIMIT', DEFAULT_ANON_IP_DAILY_LIMIT),
     globalDailyLimit: readNonNegativeIntEnv('ANON_GLOBAL_DAILY_LIMIT', DEFAULT_ANON_GLOBAL_DAILY_LIMIT),
+    signedInGlobalDailyLimit: readNonNegativeIntEnv('SIGNED_IN_GLOBAL_DAILY_LIMIT', DEFAULT_SIGNED_IN_GLOBAL_DAILY_LIMIT),
   }
 }
 
-/** Which limit was reached: shown to the user as different messages. */
-export type LimitScope = 'user' | 'session' | 'ip' | 'global'
+/**
+ * Which limit was reached: shown to the user as different messages.
+ * 'global' is the anonymous total, 'signed_in_global' the signed-in total.
+ */
+export type LimitScope = 'user' | 'session' | 'ip' | 'global' | 'signed_in_global'
 
 export interface UsageCounter {
   scope: LimitScope
@@ -99,12 +115,19 @@ export function secondsUntilUtcMidnight(now: Date = new Date()): number {
 export function usageCounters(
   who: { kind: 'user' | 'anon'; identity: string },
   clientKey: string | null,
-  limits: AnonLimits,
+  limits: ChatLimits,
   secret: string,
   now: Date = new Date(),
 ): UsageCounter[] {
   if (who.kind === 'user') {
-    return [{ scope: 'user', identity: who.identity, identityType: 'user', limit: LIMIT_SIGNED_IN }]
+    const counters: UsageCounter[] = [{ scope: 'user', identity: who.identity, identityType: 'user', limit: LIMIT_SIGNED_IN }]
+    if (limits.signedInGlobalDailyLimit > 0) {
+      counters.push({
+        scope: 'signed_in_global', identity: GLOBAL_SIGNED_IN_IDENTITY, identityType: 'global',
+        limit: limits.signedInGlobalDailyLimit,
+      })
+    }
+    return counters
   }
   const counters: UsageCounter[] = [
     { scope: 'session', identity: who.identity, identityType: 'anon', limit: LIMIT_ANONYMOUS },

@@ -1,13 +1,14 @@
 /**
- * src/api/subjects.ts: topic taxonomy.
- *
- * subjects.ts caches the full topic list in a module variable for the life of
- * the process, so every test loads a fresh app (loadFreshApp) after seeding.
+ * src/api/subjects.ts: topic taxonomy, served from an in-memory snapshot that
+ * is refreshed every 10 minutes. The snapshot is cleared before each test
+ * (test/setup.ts); tests seed first, then make their first request.
  */
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { loadFreshApp } from '../helpers/app.js'
-import { resetDb } from '../fakes/db.js'
+import { db, resetDb } from '../fakes/db.js'
 import { insertTopic } from '../helpers/fixtures.js'
+import { captureLogs, errorLogs } from '../helpers/logs.js'
+import { SUBJECTS_CACHE_CONTROL, SUBJECTS_CACHE_MS, SUBJECTS_RETRY_MS } from '../../src/api/subjects.js'
 
 beforeEach(resetDb)
 
@@ -37,10 +38,11 @@ describe('GET /api/v1/subjects', () => {
     ])
   })
 
-  it('sets Cache-Control: no-store', async () => {
+  it('lets browsers reuse it for 5 minutes (Cache-Control: public, max-age=300)', async () => {
     const app = await loadFreshApp()
     const res = await app.get('/api/v1/subjects')
-    expect(res.headers.get('Cache-Control')).toBe('no-store')
+    expect(SUBJECTS_CACHE_CONTROL).toBe('public, max-age=300')
+    expect(res.headers.get('Cache-Control')).toBe(SUBJECTS_CACHE_CONTROL)
   })
 
   it('returns an empty list when there are no topics', async () => {
@@ -48,7 +50,7 @@ describe('GET /api/v1/subjects', () => {
     expect(await (await app.get('/api/v1/subjects')).json()).toEqual([])
   })
 
-  it('caches topics in memory for the life of the process (documented behaviour)', async () => {
+  it('serves topics from memory between refreshes (documented behaviour)', async () => {
     await insertTopic({ name: 'First', slug: 'first', sort_order: 1 })
     const app = await loadFreshApp()
     expect(await (await app.get('/api/v1/subjects')).json()).toHaveLength(1)
@@ -113,10 +115,102 @@ describe('GET /api/v1/subjects/:slug', () => {
     expect(await res.json()).toEqual({ error: 'Not found' })
   })
 
-  it('is not affected by the list cache (reads live data)', async () => {
+  it('returns the full topic row, and the same fields as a direct query would', async () => {
+    await seedTaxonomy()
     const app = await loadFreshApp()
-    await app.get('/api/v1/subjects') // warm the cache while empty
-    await insertTopic({ name: 'New', slug: 'new', sort_order: 1 })
+    const { topic } = await (await app.get('/api/v1/subjects/data-science')).json()
+    expect(Object.keys(topic).sort()).toEqual([
+      'course_count', 'created_at', 'cross_provider_insights', 'description', 'id', 'insights_updated_at',
+      'meta_description', 'name', 'parent_id', 'slug', 'sort_order', 'updated_at',
+    ])
+  })
+
+  it('orders subtopics by sort_order with missing ones last', async () => {
+    const domain = await insertTopic({ name: 'D', slug: 'd', sort_order: 1 })
+    await insertTopic({ name: 'No order', slug: 'no-order', parent_id: domain.id, sort_order: null })
+    await insertTopic({ name: 'Second', slug: 'second', parent_id: domain.id, sort_order: 2 })
+    await insertTopic({ name: 'Also no order', slug: 'also-no-order', parent_id: domain.id, sort_order: null })
+    await insertTopic({ name: 'First', slug: 'first', parent_id: domain.id, sort_order: 1 })
+    const app = await loadFreshApp()
+    const { subtopics } = await (await app.get('/api/v1/subjects/d')).json()
+    const slugs = subtopics.map((t: { slug: string }) => t.slug)
+    expect(slugs.slice(0, 2)).toEqual(['first', 'second'])
+    expect(slugs.slice(2).sort()).toEqual(['also-no-order', 'no-order'])
+  })
+
+  it('sets Cache-Control on found topics, not on 404s', async () => {
+    await seedTaxonomy()
+    const app = await loadFreshApp()
+    expect((await app.get('/api/v1/subjects/data-science')).headers.get('Cache-Control')).toBe(SUBJECTS_CACHE_CONTROL)
+    expect((await app.get('/api/v1/subjects/machine-learning')).headers.get('Cache-Control')).toBe(SUBJECTS_CACHE_CONTROL)
+    expect((await app.get('/api/v1/subjects/tree')).headers.get('Cache-Control')).toBe(SUBJECTS_CACHE_CONTROL)
+    expect((await app.get('/api/v1/subjects/nope')).headers.get('Cache-Control')).toBeNull()
+  })
+})
+
+describe('taxonomy snapshot (one query for every subjects endpoint)', () => {
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }) })
+  afterEach(() => { vi.useRealTimers() })
+  const advance = (ms: number) => vi.setSystemTime(Date.now() + ms)
+
+  it('serves the list, the tree, domains, subtopics and unknown slugs from one database query', async () => {
+    await seedTaxonomy()
+    const app = await loadFreshApp()
+    const select = vi.spyOn(db, 'select')
+    for (const path of ['', '/tree', '/data-science', '/machine-learning', '/made-up-1', '/made-up-2']) {
+      await app.get(`/api/v1/subjects${path}`)
+    }
+    expect(select).toHaveBeenCalledTimes(1)
+  })
+
+  it('shares one query between simultaneous requests', async () => {
+    await seedTaxonomy()
+    const app = await loadFreshApp()
+    const select = vi.spyOn(db, 'select')
+    const responses = await Promise.all(Array.from({ length: 5 }, () => app.get('/api/v1/subjects/data-science')))
+    expect(responses.map(r => r.status)).toEqual([200, 200, 200, 200, 200])
+    expect(select).toHaveBeenCalledTimes(1)
+  })
+
+  it('picks up a changed taxonomy within 10 minutes, without a restart', async () => {
+    await insertTopic({ name: 'First', slug: 'first', sort_order: 1 })
+    const app = await loadFreshApp()
+    expect(await (await app.get('/api/v1/subjects')).json()).toHaveLength(1)
+    await insertTopic({ name: 'Added Later', slug: 'added-later', sort_order: 2 })
+
+    advance(SUBJECTS_CACHE_MS - 1_000)
+    expect((await app.get('/api/v1/subjects/added-later')).status).toBe(404)
+    advance(1_000)
+    expect(SUBJECTS_CACHE_MS).toBe(10 * 60_000)
+    expect((await app.get('/api/v1/subjects/added-later')).status).toBe(200)
+    expect(await (await app.get('/api/v1/subjects')).json()).toHaveLength(2)
+  })
+
+  it('keeps serving the last taxonomy when a refresh fails, logs it, and retries after 30 seconds', async () => {
+    await seedTaxonomy()
+    const app = await loadFreshApp()
+    expect((await app.get('/api/v1/subjects/data-science')).status).toBe(200)
+
+    const logs = captureLogs()
+    advance(SUBJECTS_CACHE_MS)
+    const select = vi.spyOn(db, 'select').mockImplementation(() => { throw new Error('connect ECONNREFUSED') })
+    expect((await app.get('/api/v1/subjects/data-science')).status).toBe(200) // stale, not 500
+    expect((await app.get('/api/v1/subjects')).status).toBe(200)
+    expect(select).toHaveBeenCalledTimes(1) // no retry on every request
+    expect(errorLogs(logs(), 'subjects_refresh_failed')).toHaveLength(1)
+
+    select.mockRestore()
+    await insertTopic({ name: 'New', slug: 'new', sort_order: 9 })
+    advance(SUBJECTS_RETRY_MS)
+    expect(SUBJECTS_RETRY_MS).toBe(30_000)
     expect((await app.get('/api/v1/subjects/new')).status).toBe(200)
+  })
+
+  it('answers 500 when the very first load fails (nothing to fall back on), and tries again next time', async () => {
+    await seedTaxonomy()
+    const app = await loadFreshApp()
+    vi.spyOn(db, 'select').mockImplementationOnce(() => { throw new Error('connect ECONNREFUSED') })
+    expect((await app.get('/api/v1/subjects')).status).toBe(500)
+    expect((await app.get('/api/v1/subjects')).status).toBe(200)
   })
 })

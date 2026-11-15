@@ -1,5 +1,6 @@
 import { createMiddleware } from 'hono/factory'
 import { verify } from 'hono/jwt'
+import { log } from '../../lib/logger.js'
 
 declare module 'hono' {
   interface ContextVariableMap {
@@ -11,6 +12,10 @@ declare module 'hono' {
  * Verifies the backend-issued JWT in `Authorization: Bearer <token>`.
  * Sets `c.var.userId` (Firebase UID) on success.
  * Returns 401 if the token is missing, invalid, or expired.
+ *
+ * Rejections are logged as one short line without the error object: expired
+ * tokens are routine, and a stack trace per bad token would let anyone run up
+ * log volume (and the Cloud Logging bill) by sending junk.
  */
 export const requireAuth = createMiddleware(async (c, next) => {
   const header = c.req.header('Authorization')
@@ -27,13 +32,14 @@ export const requireAuth = createMiddleware(async (c, next) => {
   try {
     const payload = await verify(token, secret, 'HS256') as Record<string, unknown>
     if (payload['type'] !== 'access' || typeof payload['sub'] !== 'string') {
-      console.error('[requireAuth] token type check failed:', { type: payload['type'], hasSub: typeof payload['sub'] })
+      log({ event: 'auth_rejected', reason: 'wrong_token_type' })
       return c.json({ error: 'Invalid token type' }, 401)
     }
     c.set('userId', payload['sub'])
     await next()
   } catch (err) {
-    console.error('[requireAuth] verify failed:', err)
+    // The JWT library's error name, e.g. JwtTokenExpired, JwtTokenSignatureMismatched
+    log({ event: 'auth_rejected', reason: err instanceof Error ? err.name : 'unknown' })
     return c.json({ error: 'Invalid or expired token' }, 401)
   }
 })

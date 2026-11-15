@@ -4,6 +4,8 @@ import { loadApp, type TestClient } from '../helpers/app.js'
 import { resetDb } from '../fakes/db.js'
 import { embedQuery, unitVector, vec } from '../fakes/embedding.js'
 import { insertResource, insertResources } from '../helpers/fixtures.js'
+import { captureLogs, errorLogs } from '../helpers/logs.js'
+import { LEVELS, RESOURCE_TYPES, SEARCH_LIMITS } from '../../src/api/resources.js'
 
 beforeEach(resetDb)
 
@@ -307,15 +309,157 @@ describe('GET /api/v1/resources/search: sorting and cursor pagination', () => {
     expect(await searchAllPages(app, 'q=python&sort=bogus', 1)).toEqual(relevance)
   })
 
-  it('ignores a malformed cursor and returns the first page', async () => {
+  it('refuses a malformed cursor with 400 (a client looping on page 1 would show duplicates)', async () => {
     const app = await loadApp()
     await insertResources([{ title: 'Python 1' }, { title: 'Python 2' }])
-    const first = (await search(app, 'q=python&sort=newest')).data.map(r => r.id)
     for (const cursor of ['not-base64-json', 'e30', '%%%']) {
       const res = await app.get(`/api/v1/resources/search?q=python&sort=newest&cursor=${encodeURIComponent(cursor)}`)
-      expect(res.status).toBe(200)
-      expect((await res.json()).data.map((r: { id: string }) => r.id)).toEqual(first)
+      expect(res.status).toBe(400)
+      expect(await res.json()).toEqual({ error: 'Invalid cursor' })
     }
+  })
+})
+
+describe('GET /api/v1/resources/search: input limits (checked before any paid work)', () => {
+  const get = async (query: string) => (await loadApp()).get(`/api/v1/resources/search?${query}`)
+
+  it('keeps the documented limits', () => {
+    expect(SEARCH_LIMITS).toEqual({ queryMaxChars: 200, filterMaxValues: 20, filterValueMaxChars: 50, cursorMaxChars: 1_000 })
+    expect(LEVELS).toEqual(['beginner', 'intermediate', 'advanced', 'all_levels'])
+    expect(RESOURCE_TYPES).toEqual(['course', 'program', 'degree', 'project', 'certification', 'code_along'])
+  })
+
+  it('cuts q to 200 characters quietly, after collapsing whitespace, for both keyword and semantic search', async () => {
+    const app = await loadApp()
+    // Keyword search needs every word to match: with "zebra" in the query, only the second would match
+    await insertResources([{ title: 'Python filler' }, { title: 'Python filler zebra' }])
+    const long = `python${' filler'.repeat(40)} zebra` // "zebra" is past the 200th character
+    const body = await search(app, `q=${encodeURIComponent(long)}`)
+    const embedded = embedQuery.mock.calls[0]![0]
+    expect(embedded.length).toBeLessThanOrEqual(200)
+    expect(embedded.startsWith('python filler filler')).toBe(true)
+    expect(embedded).not.toContain('zebra')
+    expect(titles(body).sort()).toEqual(['Python filler', 'Python filler zebra']) // same cut text
+  })
+
+  it('collapses whitespace and line breaks in q', async () => {
+    const app = await loadApp()
+    await search(app, `q=${encodeURIComponent('  learn \n\t  python  ')}`)
+    expect(embedQuery).toHaveBeenCalledWith('learn python')
+  })
+
+  it.each([
+    ['a level the API does not know', 'level=expert', { error: 'Invalid level: "expert"', allowed: [...LEVELS] }],
+    ['a resource_type the API does not know', 'resource_type=bootcamp', { error: 'Invalid resource_type: "bootcamp"', allowed: [...RESOURCE_TYPES] }],
+    ['more than 20 values for one filter', Array.from({ length: 21 }, (_, i) => `provider=p${i}`).join('&'), { error: 'Too many provider values', maxValues: 20 }],
+    ['a value over 50 characters', `language=${'x'.repeat(51)}`, { error: 'A language value is too long', maxLength: 50 }],
+  ])('returns 400 for %s, without calling the embedding API', async (_label, filter, body) => {
+    const res = await get(`q=python&${filter}`)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual(body)
+    expect(embedQuery).not.toHaveBeenCalled()
+  })
+
+  it('accepts 20 values and 50-character values, and ignores empty ones', async () => {
+    const app = await loadApp()
+    await insertResources([{ title: 'Python', provider: 'coursera' }])
+    const twenty = Array.from({ length: 19 }, (_, i) => `provider=p${i}`).join('&')
+    expect(titles(await search(app, `q=python&${twenty}&provider=coursera`))).toEqual(['Python'])
+    expect((await app.get(`/api/v1/resources/search?q=python&language=${'x'.repeat(50)}`)).status).toBe(200)
+    expect(titles(await search(app, 'q=python&level=&provider=&resource_type='))).toEqual(['Python'])
+  })
+})
+
+describe('GET /api/v1/resources/search: cursor validation', () => {
+  const encode = (payload: unknown) => Buffer.from(JSON.stringify(payload)).toString('base64url')
+  const ID = '3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a60'
+
+  it.each([
+    ['relevance', { sort: 'relevance', id: ID, score: 0.5 }],
+    ['rating', { sort: 'rating', id: ID, rating: 4.5 }],
+    ['rating', { sort: 'rating', id: ID, rating: null }],
+    ['most_reviewed', { sort: 'most_reviewed', id: ID, num_ratings: 100 }],
+    ['duration_asc', { sort: 'duration_asc', id: ID, duration_hours: null }],
+    ['duration_desc', { sort: 'duration_desc', id: ID, duration_hours: 2.5 }],
+    ['newest', { sort: 'newest', id: ID, created_at: '2025-01-01T00:00:03.000Z' }],
+  ])('accepts a well-formed %s cursor', async (sort, payload) => {
+    const app = await loadApp()
+    const res = await app.get(`/api/v1/resources/search?q=python&sort=${sort}&cursor=${encode(payload)}`)
+    expect(res.status).toBe(200)
+  })
+
+  it.each([
+    // The probes from the abuse report (P5): these used to reach Postgres and return 500
+    ['a non-UUID id', 'relevance', { sort: 'relevance', id: 'x', score: 0.5 }],
+    ['a missing score', 'relevance', { sort: 'relevance', id: ID }],
+    ['an invalid created_at', 'newest', { sort: 'newest', id: ID, created_at: 'yesterday' }],
+    // and the other ways a cursor can be wrong
+    ['a score that is a string', 'relevance', { sort: 'relevance', id: ID, score: '0.5; DROP TABLE' }],
+    ['a fractional num_ratings', 'most_reviewed', { sort: 'most_reviewed', id: ID, num_ratings: 1.5 }],
+    ['a rating that is a string', 'rating', { sort: 'rating', id: ID, rating: '4.5' }],
+    ['a duration that is not a number', 'duration_asc', { sort: 'duration_asc', id: ID, duration_hours: '10h' }],
+    ['a created_at Postgres might misread', 'newest', { sort: 'newest', id: ID, created_at: '01/02/2025' }],
+    ['a cursor made for another sort', 'newest', { sort: 'rating', id: ID, rating: 4 }],
+    ['a relevance cursor used with an unknown sort (which means relevance) is fine, but a rating one is not', 'bogus', { sort: 'rating', id: ID, rating: 4 }],
+    ['a JSON array', 'relevance', [1, 2]],
+    ['JSON null', 'relevance', null],
+  ])('returns 400 for %s, without calling the embedding API', async (_label, sort, payload) => {
+    const app = await loadApp()
+    const res = await app.get(`/api/v1/resources/search?q=python&sort=${sort}&cursor=${encode(payload)}`)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'Invalid cursor' })
+    expect(embedQuery).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 for a cursor over 1,000 characters', async () => {
+    const app = await loadApp()
+    const res = await app.get(`/api/v1/resources/search?q=python&cursor=${'a'.repeat(1_001)}`)
+    expect(res.status).toBe(400)
+  })
+})
+
+describe('GET /api/v1/resources/search: embedding calls', () => {
+  it('pages through a search with one embedding call (P6: it used to be one per page)', async () => {
+    const app = await loadApp()
+    await insertResources(Array.from({ length: 10 }, (_, i) => ({ title: `Python ${i}` })))
+    const ids = await searchAllPages(app, 'q=python', 2)
+    expect(ids).toHaveLength(10) // 5 pages
+    expect(embedQuery).toHaveBeenCalledTimes(1)
+  })
+
+  it('reuses the embedding for a popular query, and embeds a different query separately', async () => {
+    const app = await loadApp()
+    await search(app, 'q=learn%20python')
+    await search(app, 'q=learn%20%20python%20') // same text after whitespace is collapsed
+    await search(app, 'q=learn%20sql')
+    expect(embedQuery.mock.calls.map(([text]) => text)).toEqual(['learn python', 'learn sql'])
+  })
+
+  it.each(['rating', 'most_reviewed', 'duration_asc', 'duration_desc', 'newest'])(
+    'does not embed the query for sort=%s (only relevance ranking uses it)', async sort => {
+      const app = await loadApp()
+      await insertResources([{ title: 'Python' }])
+      const body = await search(app, `q=python&sort=${sort}`)
+      expect(titles(body)).toEqual(['Python'])
+      expect(body.vector_search).toBe(false)
+      expect(embedQuery).not.toHaveBeenCalled()
+    },
+  )
+
+  it('falls back to keyword-only on a timeout, logs it, and tries the API again on the next search', async () => {
+    const app = await loadApp()
+    const logs = captureLogs()
+    await insertResources([{ title: 'Python' }])
+    embedQuery.mockRejectedValueOnce(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }))
+    const degraded = await search(app, 'q=python')
+    expect(degraded.vector_search).toBe(false)
+    expect(titles(degraded)).toEqual(['Python'])
+    expect(errorLogs(logs(), 'search_embedding_failed')).toEqual([
+      expect.objectContaining({ message: expect.stringContaining('TimeoutError') }),
+    ])
+
+    expect((await search(app, 'q=python')).vector_search).toBe(true) // the failure wasn't cached
+    expect(embedQuery).toHaveBeenCalledTimes(2)
   })
 })
 

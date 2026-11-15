@@ -2,7 +2,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Hono } from 'hono'
 import {
-  DEFAULT_TRUST_PROXY_HOPS, clientKey, clientKeyFromAddress, clientKeyFromChain, trustProxyHops,
+  DEFAULT_TRUST_PROXY_HOPS, clientKey, clientKeyFromAddress, clientKeyFromChain, inspectChain, isNonPublicAddress,
+  trustProxyHops,
 } from '../../src/lib/client-ip.js'
 
 describe('clientKeyFromAddress', () => {
@@ -100,6 +101,47 @@ describe('clientKeyFromChain', () => {
 
   it('groups IPv6 visitors by /64', () => {
     expect(clientKeyFromChain('2001:db8:1:2::aaaa', GFE, 1)).toBe('2001:db8:1:2::/64')
+  })
+})
+
+describe('inspectChain', () => {
+  const GFE = '169.254.1.1'
+
+  it('counts X-Forwarded-For entries (a normal request through Cloud Run has exactly one)', () => {
+    expect(inspectChain('203.0.113.7', GFE, 1)).toEqual({ forwardedCount: 1, picked: '203.0.113.7' })
+  })
+
+  it('counts entries the client wrote too, ignoring empty ones', () => {
+    expect(inspectChain('192.0.2.66, , 203.0.113.7', GFE, 1)).toEqual({ forwardedCount: 2, picked: '203.0.113.7' })
+  })
+
+  it('reports no entries when the header is missing', () => {
+    expect(inspectChain(undefined, GFE, 1)).toEqual({ forwardedCount: 0, picked: GFE })
+  })
+
+  it('returns the raw picked entry, before parsing', () => {
+    expect(inspectChain('garbage', GFE, 1)).toEqual({ forwardedCount: 1, picked: 'garbage' })
+    expect(inspectChain(undefined, undefined, 0)).toEqual({ forwardedCount: 0, picked: undefined })
+  })
+})
+
+describe('isNonPublicAddress', () => {
+  it.each([
+    '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1', '127.0.0.1', '169.254.1.1', '100.64.0.1', '0.0.0.0',
+    '::1', '::', 'fd00::1', 'fc12:3456::1', 'fe80::1', 'fe80::1%eth0', '[::1]:8080', '10.0.0.1:443',
+    '::ffff:10.0.0.1', '::ffff:127.0.0.1',
+  ])('is true for %j', address => {
+    expect(isNonPublicAddress(address)).toBe(true)
+  })
+
+  it.each([
+    '203.0.113.7', '8.8.8.8', '172.32.0.1', '100.128.0.1', '2001:db8::1', '2606:4700::1111', '::ffff:8.8.8.8',
+  ])('is false for public %j', address => {
+    expect(isNonPublicAddress(address)).toBe(false)
+  })
+
+  it.each(['', 'garbage', 'example.com'])('is false for non-addresses such as %j', address => {
+    expect(isNonPublicAddress(address)).toBe(false)
   })
 })
 

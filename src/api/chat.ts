@@ -2,9 +2,10 @@
  * POST /api/v1/chat — Cora AI chat endpoint (SSE streaming).
  *
  * Auth: optional. Signed-in users send `Authorization: Bearer <token>` and get
- * a higher daily limit (10). Anonymous users send `X-Session-ID: <uuid>` and
- * get a lower limit (5), plus shared per-IP and global caps on anonymous
- * questions. Limits are counted in `chat_usage` (see chat-usage.ts).
+ * a higher daily limit (10), plus a shared total for all signed-in questions.
+ * Anonymous users send `X-Session-ID: <uuid>` and get a lower limit (5), plus
+ * shared per-IP and total caps on anonymous questions. Limits are counted in
+ * `chat_usage` (see chat-usage.ts).
  *
  * Request body: see docs/api.md. Size limits are in chat-input.ts.
  *
@@ -12,9 +13,11 @@
  *   data: {"type":"delta","content":"..."}  — one or more text chunks
  *   data: {"type":"done"}                   — stream complete
  *   data: {"type":"error","message":"..."}  — generation failed
+ *   HTTP 503 JSON                           — chat switched off by CHAT_MODE (no stream)
  *   HTTP 400 JSON                           — invalid body or identity headers
  *   HTTP 413 JSON                           — body over 512 KB (src/index.ts)
- *   HTTP 429 JSON + Retry-After             — a daily limit was reached (no stream)
+ *   HTTP 429 JSON + Retry-After             — a daily limit (limit-responses.ts), or the
+ *                                             per-minute rate limit (src/index.ts)
  */
 
 import { Hono } from 'hono'
@@ -28,12 +31,14 @@ import { retrieveForQuery } from './rag.js'
 import { matchResourceIds } from './resource-ids.js'
 import { buildRagQuery, parseChatBody, type CurrentPage } from './chat-input.js'
 import {
-  LIMIT_ANONYMOUS, LIMIT_SIGNED_IN, checkAndIncrementUsage, readAnonLimits, refundUsage,
+  LIMIT_ANONYMOUS, LIMIT_SIGNED_IN, checkAndIncrementUsage, readChatLimits, refundUsage,
   secondsUntilUtcMidnight, usageCounters, type LimitScope,
 } from './chat-usage.js'
+import { dailyLimitResponse } from './limit-responses.js'
 import { isUuid } from '../lib/ids.js'
-import { clientKey, trustProxyHops } from '../lib/client-ip.js'
-import { log } from '../lib/logger.js'
+import { trustProxyHops } from '../lib/client-ip.js'
+import { readEnumEnv } from '../lib/env.js'
+import { log, logError } from '../lib/logger.js'
 import {
   ClientDisconnected, GenerationTimeout, GENERATION_TIMEOUT_MS, MAX_OUTPUT_TOKENS, MODEL, TEMPERATURE,
   THINKING_BUDGET, TRUNCATION_NOTICE, abortable, untilAborted,
@@ -47,8 +52,23 @@ const RAG_K = 6
 
 // Read once at startup: an invalid value throws, so a bad deploy config stops
 // the new revision from starting instead of running with unintended limits.
-const ANON_LIMITS = readAnonLimits()
+const CHAT_LIMITS_PER_DAY = readChatLimits()
 const TRUST_PROXY_HOPS = trustProxyHops()
+
+/**
+ * Emergency switch (docs/deployment-gcp.md §6), changed without a build:
+ *   on              normal
+ *   signed_in_only  anonymous questions are refused (e.g. guests are abusing it)
+ *   off             every question is refused (e.g. Gemini spend is running away)
+ * Refused questions get 503 before any paid work (embedding, Gemini) or any
+ * counting. The daily limits can't do this: 0 means "no limit" there.
+ */
+export const CHAT_MODES = ['on', 'signed_in_only', 'off'] as const
+const CHAT_MODE = readEnumEnv('CHAT_MODE', CHAT_MODES, 'on')
+if (CHAT_MODE !== 'on') {
+  // Once per instance start, so the logs show the switch took effect.
+  log({ event: 'chat_mode', mode: CHAT_MODE }, 'warn')
+}
 
 const ai = new GoogleGenAI({
   vertexai: true,
@@ -104,6 +124,8 @@ function limitMessage(scope: LimitScope): string {
       return `Too many questions from your network today. Sign in to get ${LIMIT_SIGNED_IN} questions per day.`
     case 'global':
       return `Cora has reached today's limit for guest questions. Sign in to get ${LIMIT_SIGNED_IN} questions per day.`
+    case 'signed_in_global':
+      return "Cora has reached today's limit for questions. Please try again after midnight UTC."
   }
 }
 
@@ -237,6 +259,14 @@ ${pageDescription(currentPage, searchTerm)}`,
 // ─── Chat endpoint ────────────────────────────────────────────────────────────
 
 chatRouter.post('/', async (c) => {
+  if (CHAT_MODE === 'off') {
+    return c.json({
+      error: 'Chat is unavailable',
+      code: 'chat_unavailable',
+      message: 'Cora is taking a break. Please try again later.',
+    }, 503)
+  }
+
   const secret = process.env.JWT_SECRET
   if (!secret) {
     return c.json({ error: 'Server configuration error' }, 500)
@@ -264,24 +294,33 @@ chatRouter.post('/', async (c) => {
   if ('error' in resolved) {
     return c.json({ error: resolved.error }, 400)
   }
+  if (CHAT_MODE === 'signed_in_only' && resolved.kind === 'anon') {
+    return c.json({
+      error: 'Chat is unavailable for guests',
+      code: 'chat_signed_in_only',
+      message: 'Cora is only available to signed-in users right now. Sign in to continue.',
+    }, 503)
+  }
 
-  // Only anonymous questions are counted per IP.
-  const client = resolved.kind === 'anon' ? clientKey(c, TRUST_PROXY_HOPS) : null
-  if (resolved.kind === 'anon' && client === null && ANON_LIMITS.ipDailyLimit > 0) {
+  // Only anonymous questions are counted per IP. c.var.client is the visitor a
+  // trusted relay names, or the connection's client (middleware/client.ts).
+  const client = resolved.kind === 'anon' ? c.get('client').key : null
+  if (resolved.kind === 'anon' && client === null && CHAT_LIMITS_PER_DAY.ipDailyLimit > 0) {
     // Not expected on Cloud Run (its front end always sends X-Forwarded-For):
     // the per-IP limit is skipped, the session and global limits still apply.
     log({ event: 'client_ip_unknown', route: 'chat', trust_proxy_hops: TRUST_PROXY_HOPS }, 'warn')
   }
 
-  const usage = await checkAndIncrementUsage(usageCounters(resolved, client, ANON_LIMITS, secret))
+  const usage = await checkAndIncrementUsage(usageCounters(resolved, client, CHAT_LIMITS_PER_DAY, secret))
 
   if (!usage.allowed) {
-    if (usage.scope === 'ip' || usage.scope === 'global') {
-      // Signals abuse, or a shared-IP misconfiguration (see docs/deployment-gcp.md).
+    if (usage.scope !== 'user' && usage.scope !== 'session') {
+      // Shared limits: signals abuse, a shared-IP misconfiguration
+      // (docs/deployment-gcp.md §6) or, for the totals, that chat is off for
+      // a whole group until midnight UTC (docs/monitoring.md §5).
       log({ event: 'chat_limit_reached', scope: usage.scope }, 'warn')
     }
-    c.header('Retry-After', String(secondsUntilUtcMidnight()))
-    return c.json({ limitReached: true, message: limitMessage(usage.scope) }, 429)
+    return dailyLimitResponse(c, usage.scope, limitMessage(usage.scope), secondsUntilUtcMidnight())
   }
 
   // ── 3. Fetch page context resources from DB ──────────────────────────────
@@ -338,7 +377,7 @@ chatRouter.post('/', async (c) => {
     ragResources = await retrieveForQuery(ragQuery, RAG_K, pageContextResources.map(r => r.id))
   } catch (err) {
     // Non-fatal: fall back to page-context-only if embedding fails
-    console.error('[chat] RAG retrieval failed, continuing without catalogue context:', err)
+    logError('chat_rag_failed', err)
   }
 
   // ── 5. Assemble prompt and stream Gemini response ────────────────────────
@@ -417,10 +456,10 @@ chatRouter.post('/', async (c) => {
         return
       }
       outcome = timeout.signal.aborted ? 'timeout' : 'error'
-      console.error('[chat] Gemini streaming error:', err)
+      logError('chat_generation_failed', err, { outcome })
       if (!gotText) {
         await refundUsage(identities, queryDate).catch((refundErr: unknown) => {
-          console.error('[chat] failed to refund unanswered question:', refundErr)
+          logError('chat_refund_failed', refundErr)
         })
       }
       await stream.writeSSE({

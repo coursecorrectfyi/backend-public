@@ -4,6 +4,10 @@
  * Tests register ID tokens with registerIdToken(token, claims). verifyIdToken()
  * accepts only registered tokens and rejects everything else, like an invalid or
  * expired Firebase token.
+ *
+ * Registered tokens look like a Google sign-in unless the test says otherwise:
+ * `firebase.sign_in_provider` is "google.com" and `email_verified` is true, as
+ * in real Firebase tokens for Google accounts.
  */
 import { vi } from 'vitest'
 import { singleton } from '../helpers/singleton.js'
@@ -12,6 +16,8 @@ export interface FakeDecodedIdToken {
   uid: string
   email?: string
   name?: string
+  email_verified?: boolean
+  firebase?: { sign_in_provider?: string; [claim: string]: unknown }
   [claim: string]: unknown
 }
 
@@ -19,7 +25,7 @@ const tokens = singleton('firebaseTokens', () => new Map<string, FakeDecodedIdTo
 const apps = singleton('firebaseApps', () => [] as Array<{ name: string; options: unknown }>)
 
 export function registerIdToken(idToken: string, claims: FakeDecodedIdToken): void {
-  tokens.set(idToken, claims)
+  tokens.set(idToken, { firebase: { sign_in_provider: 'google.com' }, email_verified: true, ...claims })
 }
 
 // ── firebase-admin/app ──────────────────────────────────────────────────────

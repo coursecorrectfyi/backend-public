@@ -43,6 +43,13 @@
       "when": 1775075794514,
       "tag": "0005_typical_loners",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1794701986789,
+      "tag": "0006_even_songbird",
+      "breakpoints": true
     }
   ]
 }

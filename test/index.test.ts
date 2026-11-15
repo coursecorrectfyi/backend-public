@@ -9,6 +9,7 @@ import { loadApp, loadFreshApp } from './helpers/app.js'
 import { serve } from './fakes/node-server.js'
 import { db, resetDb } from './fakes/db.js'
 import { setChatUsage } from './helpers/fixtures.js'
+import { captureLogs, errorLogs } from './helpers/logs.js'
 
 beforeEach(resetDb)
 
@@ -55,6 +56,7 @@ describe('GET /health', () => {
   })
 
   it('does not expose internal error details on the public health endpoint', async () => {
+    const logs = captureLogs()
     const app = await loadApp()
     const secretDetail = 'password authentication failed for user "cc_prod" at 10.20.30.40'
     vi.spyOn(db, 'execute').mockRejectedValueOnce(new Error(secretDetail))
@@ -64,9 +66,9 @@ describe('GET /health', () => {
     expect(text).not.toContain('cc_prod')
     expect(text).not.toContain('10.20.30.40')
     // ...but the detail is still logged server-side for debugging
-    expect(console.error).toHaveBeenCalledWith(
-      '[health] database check failed:', expect.objectContaining({ message: secretDetail }),
-    )
+    expect(errorLogs(logs(), 'health_check_failed')).toEqual([
+      expect.objectContaining({ message: expect.stringContaining(secretDetail) }),
+    ])
   })
 })
 
@@ -162,5 +164,52 @@ describe('route mounting', () => {
     const app = await loadApp()
     expect((await app.get('/api/v1/does-not-exist')).status).toBe(404)
     expect((await app.get('/')).status).toBe(404)
+  })
+})
+
+describe('unexpected errors (app.onError)', () => {
+  it('answers 500 in JSON without details, and logs one structured error with the route pattern', async () => {
+    const app = await loadApp()
+    const logs = captureLogs()
+    const { accessToken, bearer } = await import('./helpers/auth.js')
+    const resourceId = '3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a60'
+    vi.spyOn(db, 'select').mockImplementationOnce(() => { throw new Error('connect ECONNREFUSED 10.20.30.40:5432') })
+
+    const res = await app.post(`/api/v1/saved/${resourceId}`, undefined, bearer(await accessToken('fb-user-1')))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Internal server error' })
+
+    const errors = errorLogs(logs(), 'unhandled_error')
+    expect(errors).toEqual([expect.objectContaining({
+      '@type': 'type.googleapis.com/google.devtools.clouderrorreporting.v1beta1.ReportedErrorEvent',
+      method: 'POST',
+      route: '/api/v1/saved/:resourceId',
+      message: expect.stringMatching(/^Error: connect ECONNREFUSED/),
+    })])
+    expect(JSON.stringify(errors)).not.toContain(resourceId)
+  })
+
+  it('does not log search terms', async () => {
+    const app = await loadApp()
+    const logs = captureLogs()
+    vi.spyOn(db, 'select').mockImplementationOnce(() => { throw new Error('boom') })
+    expect((await app.get('/api/v1/resources/search?q=my%20private%20question')).status).toBe(500)
+    const errors = errorLogs(logs(), 'unhandled_error')
+    expect(errors).toEqual([expect.objectContaining({ route: '/api/v1/resources/search' })])
+    expect(JSON.stringify(errors)).not.toContain('private')
+  })
+
+  it('keeps the response of an HTTPException (Hono middleware convention), without logging an error', async () => {
+    const { Hono } = await import('hono')
+    const { HTTPException } = await import('hono/http-exception')
+    const { handleError } = await import('../src/api/error-handler.js')
+    // The app's own handler on a tiny app: no route in the API throws HTTPException today.
+    const mini = new Hono()
+    mini.onError(handleError)
+    mini.get('/', () => { throw new HTTPException(418, { message: 'teapot' }) })
+    const logs = captureLogs()
+    const res = await mini.request('/')
+    expect(res.status).toBe(418)
+    expect(errorLogs(logs(), 'unhandled_error')).toEqual([])
   })
 })

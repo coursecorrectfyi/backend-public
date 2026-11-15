@@ -2,13 +2,20 @@ import { Hono } from 'hono'
 import { sign, verify } from 'hono/jwt'
 import { initializeApp, getApps, applicationDefault } from 'firebase-admin/app'
 import { getAuth } from 'firebase-admin/auth'
+import { sql } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { users } from '../db/schema.js'
+import { log } from '../lib/logger.js'
+import { checkSignIn, providerName, readAllowedProviders } from './auth-providers.js'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const ACCESS_TOKEN_TTL_S = 60 * 60        // 1 hour
 const REFRESH_TOKEN_TTL_S = 60 * 60 * 24 * 7  // 7 days
+
+// Read once at startup: an unknown provider id throws, so a typo stops the
+// new revision from starting (see auth-providers.ts).
+const ALLOWED_PROVIDERS = readAllowedProviders()
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -46,7 +53,8 @@ export const authRouter = new Hono()
 /**
  * POST /api/v1/auth/firebase/login
  * Body: { idToken: string }
- * Verifies the Firebase ID token, upserts the user row, and returns backend JWTs.
+ * Verifies the Firebase ID token, checks the sign-in method is allowed
+ * (auth-providers.ts), upserts the user row, and returns backend JWTs.
  */
 authRouter.post('/firebase/login', async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
@@ -60,6 +68,14 @@ authRouter.post('/firebase/login', async (c) => {
     decoded = await getAuth(getFirebaseApp()).verifyIdToken(idToken)
   } catch {
     return c.json({ error: 'Invalid Firebase ID token' }, 401)
+  }
+
+  const providerId = decoded.firebase?.sign_in_provider
+  const check = checkSignIn(decoded, ALLOWED_PROVIDERS)
+  if (!check.allowed) {
+    // No user row is created for a refused sign-in.
+    log({ event: 'login_rejected', reason: check.code, provider: typeof providerId === 'string' ? providerId : null })
+    return c.json({ error: check.error, code: check.code }, check.status)
   }
 
   const uid = decoded.uid
@@ -77,9 +93,21 @@ authRouter.post('/firebase/login', async (c) => {
       target: users.firebase_uid,
       set: { email, updated_at: new Date() },
     })
-    .returning()
+    .returning({
+      firebase_uid: users.firebase_uid,
+      email: users.email,
+      created_at: users.created_at,
+      updated_at: users.updated_at,
+      // Postgres idiom: xmax is 0 for a freshly inserted row and non-zero
+      // when ON CONFLICT updated an existing one.
+      isNew: sql<boolean>`(xmax = 0)`,
+    })
 
   if (!user) return c.json({ error: 'Failed to upsert user' }, 500)
+
+  // One line per new account, by sign-in method: watch sign-up volume per
+  // provider (docs/monitoring.md). No identity is logged.
+  if (user.isNew) log({ event: 'user_signed_up', provider: providerId })
 
   const tokens = await issueTokens(uid)
 
@@ -88,7 +116,7 @@ authRouter.post('/firebase/login', async (c) => {
     user: {
       id: user.firebase_uid,
       email: user.email,
-      provider: 'google',
+      provider: providerName(providerId!), // checkSignIn only allows known string ids
       socialId: uid,
       firstName,
       lastName,

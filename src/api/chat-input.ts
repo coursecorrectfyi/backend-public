@@ -16,6 +16,7 @@
  */
 
 import { isLegacyMongoId, isUuid } from '../lib/ids.js'
+import { collapseWhitespace, truncate } from '../lib/text.js'
 
 export const CHAT_LIMITS = {
   /** Request body size. Larger bodies get 413 before they are parsed. */
@@ -59,18 +60,6 @@ export interface ChatInput {
 export type ParseResult =
   | { ok: true; input: ChatInput }
   | { ok: false; error: Record<string, unknown> }
-
-/**
- * Cuts `text` to at most `maxChars` UTF-16 code units without splitting a
- * surrogate pair (an emoji cut in half would become an invalid character).
- */
-export function truncate(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text
-  let end = maxChars
-  const last = text.charCodeAt(end - 1)
-  if (last >= 0xd800 && last <= 0xdbff) end -= 1 // high surrogate: its pair is past the cut
-  return text.slice(0, end)
-}
 
 /**
  * Keeps well-formed turns, then the most recent ones that fit the turn and
@@ -122,7 +111,7 @@ export function normalizePageContextIds(raw: unknown): string[] {
  */
 export function normalizeSearchTerm(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined
-  const term = truncate(raw.replace(/\s+/g, ' ').trim(), CHAT_LIMITS.searchTermMaxChars).trim()
+  const term = truncate(collapseWhitespace(raw), CHAT_LIMITS.searchTermMaxChars).trim()
   return term || undefined
 }
 

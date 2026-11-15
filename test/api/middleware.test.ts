@@ -5,8 +5,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { loadApp } from '../helpers/app.js'
 import { accessToken, bearer, mintToken, refreshToken } from '../helpers/auth.js'
-import { resetDb } from '../fakes/db.js'
+import { db, resetDb } from '../fakes/db.js'
 import { insertResource, saveCourse } from '../helpers/fixtures.js'
+import { captureLogs } from '../helpers/logs.js'
 
 beforeEach(resetDb)
 
@@ -87,5 +88,36 @@ describe('requireAuth', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.data.map((r: { title: string }) => r.title)).toEqual(['Mine'])
+  })
+
+  describe('logging (one short line per rejected token, no error objects or stack traces)', () => {
+    it.each([
+      ['an expired token', () => mintToken({ expiresIn: -60 }), 'JwtTokenExpired'],
+      ['a token signed with another secret', () => mintToken({ secret: 'some-other-secret' }), 'JwtTokenSignatureMismatched'],
+      ['a garbage token', async () => 'not-a-jwt', 'JwtTokenInvalid'],
+      ['a refresh token', () => refreshToken(), 'wrong_token_type'],
+    ])('logs %s as auth_rejected', async (_label, token, reason) => {
+      const app = await loadApp()
+      const logs = captureLogs()
+      await app.get('/api/v1/saved', bearer(await token()))
+      expect(logs()).toEqual([{ event: 'auth_rejected', reason, level: 'info', severity: 'INFO', ts: expect.any(String) }])
+      expect(console.error).not.toHaveBeenCalled()
+    })
+
+    it('does not log anything for a valid token', async () => {
+      const app = await loadApp()
+      const logs = captureLogs()
+      expect((await app.get('/api/v1/saved', bearer(await accessToken()))).status).toBe(200)
+      expect(logs().filter(l => l.event === 'auth_rejected')).toEqual([])
+    })
+  })
+
+  it('returns 500, not 401, when the route fails after authentication (so the frontend does not sign the user out)', async () => {
+    const app = await loadApp()
+    const logs = captureLogs()
+    vi.spyOn(db, 'select').mockImplementationOnce(() => { throw new Error('connection refused') })
+    const res = await app.get('/api/v1/saved', bearer(await accessToken()))
+    expect(res.status).toBe(500)
+    expect(logs().filter(l => l.event === 'auth_rejected')).toEqual([])
   })
 })

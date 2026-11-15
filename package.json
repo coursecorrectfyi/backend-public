@@ -15,7 +15,8 @@
     "insights:dry": "tsx src/jobs/insights/dry-run.ts",
     "insights:batch": "tsx src/jobs/insights/batch.ts",
     "insights:batch:dry": "DRY_RUN_LIMIT=50 tsx src/jobs/insights/batch.ts",
-    "topics:seed": "tsx src/db/seeds/topics.ts"
+    "topics:seed": "tsx src/db/seeds/topics.ts",
+    "retention:chat-usage": "tsx src/jobs/chat-usage-retention.ts"
   },
   "dependencies": {
     "@google-cloud/vertexai": "^1.10.0",
