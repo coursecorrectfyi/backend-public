@@ -43,6 +43,27 @@ Also:
 4. **Typo tolerance** (e.g. trigram similarity).
 5. **The ranking mode in the cursor.**
 
+**Performance constraints (measured).** A benchmark on a production-sized copy of the catalogue (~74k resources,
+768-d embeddings, HNSW index ~290 MB) compared today's query with a prototype of step 2 (any-word keyword top-50 plus
+HNSW top-50, merged with RRF). The target database is small: a 1 GB RAM VM (see
+[smaller embeddings](#smaller-embeddings-halfvec)), so these are requirements, not nice-to-haves:
+- **Cap the keyword side.** With any-word matching, `data science`, `machine learning` and `project management` each
+  matched 24–32k resources (a third or more of the catalogue). Ranking all of them took 0.5–3 s with a cold cache and
+  never got fast, even on a managed instance, because the scan doesn't fit in the cache. Single words with 2–4k matches
+  were fine (35–70 ms warm). Options: match all words first and fall back to any word only when results are thin; or
+  rank only a capped candidate set. Whatever the choice, the cost must not grow with the number of matches.
+- **Set `hnsw.ef_search` to at least the vector top-N** (`SET LOCAL` inside the query's transaction). pgvector's
+  default of 40 silently caps an HNSW scan at 40 rows: the prototype asked for 50 and got 40.
+- **Filters and the vector side.** Taking the HNSW top-N and then applying filters (`provider`, `level`, `is_free`, …)
+  can leave few or no rows for a rare filter. Use pgvector 0.8 iterative scans (`hnsw.iterative_scan = relaxed_order`,
+  bounded by `hnsw.max_scan_tuples`) or a larger N, and test with a rare filter.
+- **Read embeddings only through the vector index.** Today's query computes the distance for every keyword match,
+  which reads each match's embedding from TOAST. That is most of its cost on broad terms.
+- **Typo tolerance:** `pg_trgm` is fine if the trigram index covers titles only (small).
+- **Keep chat RAG as it is:** the HNSW top-6 took ~2–4 ms everywhere.
+- **Tests:** PGlite tests can check results and plan shape (e.g. `EXPLAIN` uses the HNSW and GIN indexes, no
+  sequential scan), not speed. Speed is checked separately on the real catalogue, which isn't part of this repo.
+
 ### Product analytics, privacy-first
 
 *Requested during the abuse-hardening work.*
@@ -133,3 +154,17 @@ recommendation was followed, and nothing tracks them today: course links point s
   to `dist/src/` and `npm start` / the Docker image break.
 - **Platform dependencies.** Keep the table in the [README](../README.md#platform-dependencies) up to date when adding
   a Google Cloud or Firebase dependency, so a move stays possible.
+
+### Smaller embeddings (`halfvec`)
+
+The database is moving from Cloud SQL to a self-managed Postgres on a 1 GB RAM VM, to cut cost. Embeddings are
+`vector(768)`: ~3 KB each, so Postgres stores them out of line (TOAST), and the HNSW index is ~290 MB for ~74k
+resources. Switching to `halfvec(768)` (16-bit floats, pgvector ≥ 0.7) measured on a copy of the catalogue:
+- HNSW index 288 → 144 MB; table 833 → 538 MB; embeddings fit in the row (no TOAST).
+- Search after a restart (cold cache) about 2× faster on the 1 GB VM; warm times unchanged.
+- **Same results:** for 10 query vectors, all 60 of the top-6 RAG results were identical.
+
+It leaves room for growth: at ~150k resources the `vector` index would be ~580 MB (more than the VM can cache), the
+`halfvec` one ~290 MB. What's needed: the column type and a migration (rebuild the HNSW index with
+`halfvec_cosine_ops`), the `::vector` casts in `resources.ts` and `rag.ts`, the embed job, and tests showing equivalent
+search/RAG results. Best done before the [search quality](#search-quality) work, which then builds on the final type.
