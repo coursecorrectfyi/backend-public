@@ -8,61 +8,19 @@ it's been looked into, which direction to take. Move an item into a plan of its 
 
 ### Search quality
 
-*Raised while reviewing search in the abuse-hardening work.*
+*Raised while reviewing search in the abuse-hardening work.* The search was rebuilt: keyword and semantic candidates
+merged by rank fusion, typo correction, a weighted rating, the ranking mode in the cursor, bounded cost per query
+([search.md](search.md); the problems it started from and the decisions: [search-decisions.md](search-decisions.md)).
 
-**How search works today** (`src/api/resources.ts`):
-1. **Which results come back: keywords only.** A resource matches if its text contains *every* word of the query,
-   after English stemming and dropping stop words (`plainto_tsquery`). The embedding takes no part in this step.
-2. **In what order:** with `sort=relevance`, 0.6 × keyword score + 0.4 × semantic similarity between the query and the
-   resource. With any other sort, by that field, and the embedding isn't computed at all.
-
-So "hybrid" currently means keyword filtering plus semantic re-ranking. A probe on the test database showed:
-
-| Query | Result |
-|---|---|
-| `best python course for data analysis beginners` | **nothing**, although "Python for Data Analysis" exists |
-| `learn to build websites` | **nothing**, although "Web Development Bootcamp … build websites" exists |
-| `how to make a website`, with the query vector pointing straight at Web Development | **nothing**: semantic similarity can't add results |
-| `pyhton` | **nothing** (no typo tolerance) |
-| `python`, `sort=rating` | a 5.0 with **1** rating above a 4.8 with **20,000** |
-
-Also:
-- **Two scales, fixed weights:** the keyword and semantic scores are on different scales and mixed with untuned weights.
-- **Resources without an embedding yet sink:** they get 0 for the semantic part until the embedding job has run.
-- **Pagination can skip or repeat items** if one page was ranked with embeddings and the next fell back to keyword-only
-  (an embedding timeout). The query-embedding cache makes this rarer; putting the ranking mode into the cursor would fix it.
-- **It gets slower with a larger catalogue:** the combined score is computed for every keyword match, and the vector
-  index isn't used by search.
-
-**Direction:**
-1. **Measure first:** a small set of real queries with known good answers, and the zero-result rate from analytics (below).
-2. **Retrieve from both sides:** keyword matches where *any* word matches (ranked), plus the nearest semantic matches
-   from the vector index. Merge them with reciprocal rank fusion, which needs no calibrated scores.
-3. **A weighted rating for the rating sort**, so a few ratings count for less. The insights job already ranks by
-   `rating × ln(num_ratings + 1)`.
-4. **Typo tolerance** (e.g. trigram similarity).
-5. **The ranking mode in the cursor.**
-
-**Performance constraints (measured).** A benchmark on a production-sized copy of the catalogue (~74k resources,
-768-d embeddings, HNSW index ~290 MB) compared today's query with a prototype of step 2 (any-word keyword top-50 plus
-HNSW top-50, merged with RRF). The target database is small: a 1 GB RAM VM (see
-[smaller embeddings](#smaller-embeddings-halfvec)), so these are requirements, not nice-to-haves:
-- **Cap the keyword side.** With any-word matching, `data science`, `machine learning` and `project management` each
-  matched 24–32k resources (a third or more of the catalogue). Ranking all of them took 0.5–3 s with a cold cache and
-  never got fast, even on a managed instance, because the scan doesn't fit in the cache. Single words with 2–4k matches
-  were fine (35–70 ms warm). Options: match all words first and fall back to any word only when results are thin; or
-  rank only a capped candidate set. Whatever the choice, the cost must not grow with the number of matches.
-- **Set `hnsw.ef_search` to at least the vector top-N** (`SET LOCAL` inside the query's transaction). pgvector's
-  default of 40 silently caps an HNSW scan at 40 rows: the prototype asked for 50 and got 40.
-- **Filters and the vector side.** Taking the HNSW top-N and then applying filters (`provider`, `level`, `is_free`, …)
-  can leave few or no rows for a rare filter. Use pgvector 0.8 iterative scans (`hnsw.iterative_scan = relaxed_order`,
-  bounded by `hnsw.max_scan_tuples`) or a larger N, and test with a rare filter.
-- **Read embeddings only through the vector index.** Today's query computes the distance for every keyword match,
-  which reads each match's embedding from TOAST. That is most of its cost on broad terms.
-- **Typo tolerance:** `pg_trgm` is fine if the trigram index covers titles only (small).
-- **Keep chat RAG as it is:** the HNSW top-6 took ~2–4 ms everywhere.
-- **Tests:** PGlite tests can check results and plan shape (e.g. `EXPLAIN` uses the HNSW and GIN indexes, no
-  sequential scan), not speed. Speed is checked separately on the real catalogue, which isn't part of this repo.
+What's left needs production data:
+- **Tuning and rollout:** the baseline of the previous search, calibrating the evaluation's judge, then the settings in
+  `src/search/config.ts`, and performance on the VM. In order: [search.md, "Tuning and rollout"](search.md#tuning-and-rollout).
+- **Possible code changes,** if the measurements call for them (broad queries, the distance floor, false typo
+  corrections, a quality prior, `lr_is_active_idx`, latency): [search.md](search.md#when-a-measurement-calls-for-a-code-change).
+- **Query syntax** (quotes for phrases, `-word` to exclude) isn't supported. Only worth adding if users try it.
+- **"free" in a query** is ignored as a generic word. It could set the `is_free` filter instead, as "beginner" could
+  set `level`. The search log doesn't record query text, so how often people type such words is unknown. A privacy-safe
+  count (e.g. a `level_word` / `free_word` flag in the log line) would tell.
 
 ### Product analytics, privacy-first
 
@@ -74,8 +32,9 @@ recommendation was followed, and nothing tracks them today: course links point s
 
 **Direction:**
 - **Question first, counts only:** decide which decisions the data is for, then collect the minimum.
-- **Cheapest route:** structured log events (like `chat_answer`) plus Log Analytics (free), rolled up daily into
-  tables like `chat_usage_daily` (counts per day, no identities).
+- **Cheapest route:** structured log events (like `chat_answer` and `search`) plus Log Analytics (free), rolled up daily into
+  tables like `chat_usage_daily` (counts per day, no identities). The `search` event already gives the zero-result
+  rate, filter and sort usage and paging depth ([operations.md §3b](operations.md#3b-search-logs)).
 - **Never store raw search text:** people type personal data into search boxes. At most, keep queries that many
   distinct sessions searched on the same day.
 - **Outbound clicks** via a small redirect endpoint (e.g. `/go/:resourceId`) that counts and then redirects.
@@ -154,17 +113,3 @@ recommendation was followed, and nothing tracks them today: course links point s
   to `dist/src/` and `npm start` / the Docker image break.
 - **Platform dependencies.** Keep the table in the [README](../README.md#platform-dependencies) up to date when adding
   a Google Cloud or Firebase dependency, so a move stays possible.
-
-### Smaller embeddings (`halfvec`)
-
-The database is moving from Cloud SQL to a self-managed Postgres on a 1 GB RAM VM, to cut cost. Embeddings are
-`vector(768)`: ~3 KB each, so Postgres stores them out of line (TOAST), and the HNSW index is ~290 MB for ~74k
-resources. Switching to `halfvec(768)` (16-bit floats, pgvector ≥ 0.7) measured on a copy of the catalogue:
-- HNSW index 288 → 144 MB; table 833 → 538 MB; embeddings fit in the row (no TOAST).
-- Search after a restart (cold cache) about 2× faster on the 1 GB VM; warm times unchanged.
-- **Same results:** for 10 query vectors, all 60 of the top-6 RAG results were identical.
-
-It leaves room for growth: at ~150k resources the `vector` index would be ~580 MB (more than the VM can cache), the
-`halfvec` one ~290 MB. What's needed: the column type and a migration (rebuild the HNSW index with
-`halfvec_cosine_ops`), the `::vector` casts in `resources.ts` and `rag.ts`, the embed job, and tests showing equivalent
-search/RAG results. Best done before the [search quality](#search-quality) work, which then builds on the final type.

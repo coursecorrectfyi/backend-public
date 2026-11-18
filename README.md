@@ -4,7 +4,7 @@ Backend for [CourseCorrect](https://coursecorrect.fyi), a search and recommendat
 
 One TypeScript codebase (Hono + Node.js, ESM) produces two kinds of deployables:
 
-- **API service** (`src/index.ts`, `src/api/`): REST API with hybrid search (Postgres full-text + pgvector), saved courses, subjects and a streaming AI learning assistant ("Cora").
+- **API service** (`src/index.ts`, `src/api/`, `src/search/`): REST API with hybrid search (Postgres full-text + pgvector, merged by rank fusion), saved courses, subjects and a streaming AI learning assistant ("Cora").
 - **Batch jobs** (`src/jobs/`): enrich the course catalogue with vector embeddings and AI-generated insights, and keep chat usage data to 7 days.
 
 Both share the Drizzle schema in `src/db/schema.ts`.
@@ -14,7 +14,8 @@ Both share the Drizzle schema in `src/db/schema.ts`.
 ```
 catalogue  learning_resources (+ course_reviews), populated by an ingestion pipeline not included here
 
-embed      resources without embeddings → text-embedding-004 (768d) → pgvector column
+embed      resources without embeddings → text-embedding-004 (768d) → pgvector column (halfvec);
+           then the search vocabulary (typo correction) is rebuilt
 insights   top-rated resources → LLM grounded with O*NET / BLS data → ai_insights JSON
 retention  chat_usage older than 7 days → daily totals (chat_usage_daily), then deleted
 
@@ -26,7 +27,7 @@ database, and the retention job recomputes its totals.
 
 The API contract (endpoints, request limits, error responses, requirements for clients) is documented in [docs/api.md](docs/api.md). Sign-in methods, and how to add one, are in [docs/auth-providers.md](docs/auth-providers.md). What to remember when running it in production (checks per release, analytics, privacy) is in [docs/operations.md](docs/operations.md), and which alerts, dashboards and spending brakes to set up on Google Cloud (with their cost) in [docs/monitoring.md](docs/monitoring.md).
 
-**Search** finds resources whose trigger-maintained `search_document` tsvector matches every word of the query, and (for `sort=relevance`) ranks them by combining `ts_rank` with pgvector cosine similarity against the embedded query (limits and gaps: [docs/backlog.md](docs/backlog.md#search-quality)). **Abuse and cost limits** (daily chat limits, per-minute rate limits, input and body caps, sign-in rules) are described for clients in [docs/api.md](docs/api.md#rate-limits) and, for operators, [docs/deployment-gcp.md §6](docs/deployment-gcp.md#6-client-ip-and-abuse-limits). **Chat** streams Gemini responses over SSE, grounded in the resources on the user's current page plus retrieved resources (RAG).
+**Search** merges keyword matches (the trigger-maintained `search_document` tsvector: all words first, then any word) with the nearest neighbours of the embedded query (pgvector HNSW) by reciprocal rank fusion. It corrects typos against a vocabulary of catalogue words, and every sort orders the same results. How it works, its settings and how to tune them: [docs/search.md](docs/search.md); why: [docs/search-decisions.md](docs/search-decisions.md). **Abuse and cost limits** (daily chat limits, per-minute rate limits, input and body caps, sign-in rules) are described for clients in [docs/api.md](docs/api.md#rate-limits) and, for operators, [docs/deployment-gcp.md §6](docs/deployment-gcp.md#6-client-ip-and-abuse-limits). **Chat** streams Gemini responses over SSE, grounded in the resources on the user's current page plus retrieved resources (RAG).
 
 ## Project layout
 
@@ -35,15 +36,19 @@ src/
   index.ts              API entry point (Hono)
   api/                  routes: auth (+ sign-in rules), resources, saved, subjects, chat (+ input, limits, generation), health;
                         rag.ts; error handler; middleware/ (auth, body limits, client identity, rate limits, proxy check)
+  search/               search: config.ts (every tunable value), keyword and semantic candidates, fusion, ordering,
+                        cursors, typo correction (docs/search.md)
   db/                   schema.ts (Drizzle), client.ts, seeds/
   lib/                  shared code: embedding client and query cache, client IP, trusted relay, rate limiter,
                         chat_usage retention, structured logger, env and text helpers
   jobs/
-    embed.ts            embeddings backfill
+    embed.ts            embeddings backfill (then rebuilds the search vocabulary)
+    search-vocabulary.ts  rebuilds the search vocabulary on its own
     chat-usage-retention.ts  daily chat_usage retention
     insights/           AI insights (Vertex AI, Groq or Gemini)
     onet/               O*NET / BLS occupation data seed + lookup
 migrations/             Drizzle SQL migrations
+eval/search/            search quality evaluation on the real catalogue (npm run search:eval; not deployed)
 docs/                   API reference, deployment, operations, monitoring and sign-in guides, plans and backlog
 ```
 
@@ -54,7 +59,7 @@ The API runs on Google Cloud today. To keep a move possible, provider-specific c
 | Dependency | Used for | Where | What moving would take |
 |---|---|---|---|
 | Cloud Run | hosting | nothing in code except finding the client IP: `TRUST_PROXY_HOPS`, `src/lib/client-ip.ts` | any container host. Count the proxies in front first ([deployment-gcp.md §6](docs/deployment-gcp.md#revisit-trust_proxy_hops-whenever-the-path-to-the-api-changes), "Move off Cloud Run") |
-| Cloud SQL | PostgreSQL + pgvector | `src/db/client.ts` (only the Unix-socket URL form is Cloud SQL-specific) | any PostgreSQL 15+ with pgvector |
+| Cloud SQL | PostgreSQL + pgvector | `src/db/client.ts` (only the Unix-socket URL form is Cloud SQL-specific) | any PostgreSQL 15+ with pgvector 0.8+ |
 | Vertex AI: Gemini 2.5 Flash | chat answers | `src/api/chat.ts`, `src/api/chat-generation.ts` (`@google/genai`) | another model SDK. The output budget (thinking tokens) and usage fields are Gemini-specific |
 | Vertex AI: text-embedding-004 | search and chat retrieval | `src/lib/embedding/vertex.ts`; 768 dimensions in the schema and index | another embedding model means **re-embedding the whole catalogue** (and a migration if the dimensions change) |
 | Firebase Authentication | sign-in | the login exchange only: `src/api/auth.ts`, `src/api/auth-providers.ts`; user ids are Firebase UIDs | a new login exchange and stable user ids ([auth-providers.md](docs/auth-providers.md#moving-off-firebase-auth)). Everything after login uses the backend's own tokens |
@@ -65,7 +70,7 @@ The batch jobs' insights provider is already switchable (`INSIGHTS_PROVIDER`: Ve
 
 ## Getting started
 
-Requirements: Node.js 22 (as in the Docker images), PostgreSQL 15+ with the [pgvector](https://github.com/pgvector/pgvector) extension, and a Google Cloud project with Vertex AI enabled (for embeddings, extraction and chat).
+Requirements: Node.js 22 (as in the Docker images), PostgreSQL 15+ with the [pgvector](https://github.com/pgvector/pgvector) extension (0.8+), and a Google Cloud project with Vertex AI enabled (for embeddings, extraction and chat).
 
 ```sh
 npm install
@@ -119,6 +124,8 @@ All configuration is through environment variables (see `.env.example`).
 | `npm run insights:dry` / `insights:batch[:dry]` | AI insights for one resource / a batch (`:dry` = 50) |
 | `npm run topics:seed`, `npm run onet:seed` | Seed subjects / O*NET occupation data |
 | `npm run retention:chat-usage` | Summarize completed days into `chat_usage_daily`, delete `chat_usage` rows older than 7 days (a daily job in production) |
+| `npm run search:vocabulary` | Rebuild the search vocabulary (typo correction); the embed job also does it |
+| `npm run search:eval` | Evaluate search quality on a copy of the catalogue ([eval/search/README.md](eval/search/README.md)) |
 
 ## Testing
 
@@ -126,14 +133,14 @@ All configuration is through environment variables (see `.env.example`).
 npm test               # run the whole suite once (no database, credentials or network needed)
 npm run test:watch     # re-run on file changes
 npm run test:coverage  # also writes an HTML report to coverage/index.html
-npm run typecheck      # type-check src/ and test/ (Vitest runs tests without type-checking)
+npm run typecheck      # type-check src/, test/ and eval/ (Vitest runs tests without type-checking)
 ```
 
-The suite covers the API (`src/index.ts`, `src/api/`), the shared code in `src/lib/` (including the embedding client) and the retention job. Every production dependency is replaced with an in-process fake in `test/setup.ts`:
+The suite covers the API (`src/index.ts`, `src/api/`), search (`src/search/`: golden queries in `test/api/search-golden.test.ts`, each step and the query plans in `test/search/`), the shared code in `src/lib/` (including the embedding client), the halfvec migration (`test/db/`), the retention and vocabulary jobs, and the search evaluation harness (`test/eval/`). Every production dependency is replaced with an in-process fake in `test/setup.ts`:
 
 | Production | In tests |
 |---|---|
-| Postgres + pgvector | [PGlite](https://pglite.dev) (Postgres compiled to WASM, with pgvector), schema built from `migrations/*.sql`, emptied before each test |
+| Postgres + pgvector, pg_trgm, fuzzystrmatch | [PGlite](https://pglite.dev) (Postgres compiled to WASM, with the same extensions), schema built from `migrations/*.sql`, emptied before each test |
 | Vertex AI embeddings | `test/fakes/embedding.ts`: controllable `embedQuery()` |
 | Gemini (`@google/genai`) | `test/fakes/genai.ts`: scripted streaming replies |
 | Firebase Admin | `test/fakes/firebase.ts`: tokens registered per test |
@@ -145,6 +152,8 @@ In-memory per-instance state (rate-limit buckets, caches, once-a-minute log wind
 Search, pagination, upserts and daily chat limits run real SQL against PGlite, so the tests also check the hand-written parts of the migrations (pgvector, the `search_document` trigger). Each test file gets its own database. A migrated snapshot is built once and cached in the OS temp dir, keyed by the migration files, so it is rebuilt automatically when the schema changes.
 
 Tests describe the *correct* behaviour. A known bug that hasn't been fixed yet is written as `it.fails(...)` with a `KNOWN BUG` comment: it runs on every build and reports "expected fail". When the bug is fixed, the test starts failing, which reminds you to change it to `it(...)`. Run `grep -rn "KNOWN BUG" test/` to list them.
+
+Tests must give the same result on every run. Where an order has ties (broken by random UUIDs) or a plan depends on table size, the tests use fixed ids, compare against an order computed from the ids, or say why they're exact: see [docs/search.md, Tests](docs/search.md#tests) for the search tests.
 
 ## Database migrations
 
@@ -159,7 +168,7 @@ In production, migrations are applied by hand before the release that needs them
 migration must keep working with the version that's still running. Procedure and rules:
 [docs/deployment-gcp.md, "Migrations"](docs/deployment-gcp.md#migrations).
 
-The first migration contains hand-written SQL that Drizzle Kit cannot generate: `CREATE EXTENSION vector`, the HNSW index on `learning_resources.embedding` and the `search_document` tsvector trigger.
+The first migration contains hand-written SQL that Drizzle Kit cannot generate: `CREATE EXTENSION vector` and the `search_document` tsvector trigger (and an HNSW index, which `0007` replaced with one declared in the schema). `0007` stores embeddings as `halfvec`; it rewrites the table, so read [its notes](docs/deployment-gcp.md#the-halfvec-migration-0007) before applying it to a database in use. `0008` adds hand-written `CREATE EXTENSION` lines (`pg_trgm`, `fuzzystrmatch`) before the generated vocabulary table; fill the table afterwards with `npm run search:vocabulary` ([notes](docs/deployment-gcp.md#the-search-vocabulary-0008)).
 
 To re-run a job for existing resources, reset its column (`embedding` or `ai_insights` on `learning_resources`) to `NULL` and run the job again.
 

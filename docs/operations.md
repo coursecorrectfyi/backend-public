@@ -82,6 +82,15 @@ follows [auth-providers.md](auth-providers.md#adding-a-method-checklist).
   Occasional lines with one client and a high `max_per_client` are scripts being stopped, which is the point. Lines
   during normal hours with many clients, or a group that's always near its budget, mean a budget is too tight: raise
   that `RATE_LIMIT_*_PER_MIN`.
+- **Search** (`search` logs, see [§3b](#3b-search-logs)):
+  - the zero-result rate: a rise after a release or a catalogue change is worth a look;
+  - how often `scan_cap_hit` is true;
+  - p95 `duration_ms`.
+
+  What these numbers mean for tuning: [search.md](search.md#operations).
+- **The search vocabulary is fresh:** typo correction uses it, and it's rebuilt by the embed job. After changing the
+  catalogue without running the embed job, run `npm run search:vocabulary`. It's stale if the newest resource is much
+  newer than the last `search_vocabulary_refreshed` log line.
 - **Answer sizes and cost** (`chat_answer` logs, see [§3a](#3a-chat-answer-logs)). If more than a few percent of answers are
   `truncated`, raise `ANSWER_MAX_TOKENS`. If `timeout` shows up regularly, look at Gemini latency before raising
   `GENERATION_TIMEOUT_MS`. Both are in `src/api/chat-generation.ts`.
@@ -128,6 +137,66 @@ gcloud logging read 'resource.type="cloud_run_revision" AND jsonPayload.event="c
 For a dashboard or alert instead of ad-hoc queries, create a
 [log-based counter metric](https://cloud.google.com/logging/docs/logs-based-metrics/counter-metrics) on
 `jsonPayload.event="chat_answer"` with a label extracted from `jsonPayload.outcome`.
+
+### 3b. Search logs
+
+Every answered search (not the `400`s) writes one structured log line. It never contains the query text (people type
+personal data into search boxes) or anything about the visitor:
+
+```json
+{"event":"search","sort":"relevance","mode":"hybrid","embedding":"cached","page":"first","results":20,
+ "has_more":true,"query_words":3,"corrected":false,"filters":["level","provider"],"keyword_tier":"all",
+ "keyword_candidates":100,"semantic_candidates":64,"scan_cap_hit":false,"duration_ms":85}
+```
+
+| Field | Meaning |
+|---|---|
+| `sort` | the sort used (unknown values are logged as `relevance`, which is what they get) |
+| `mode` | `hybrid`: found and ranked with the query embedding. `keyword`: keywords only, because the embedding failed (on page 1, or page 1 was already keyword-only) |
+| `embedding` | `cached` (this instance had it), `computed` (one embedding API call), `failed` (error or timeout, see `search_embedding_failed`), `not_needed` (a later page of a keyword-only search) |
+| `page` | `first` (no cursor) or `next`. The zero-result rate counts `first` only |
+| `results`, `has_more` | results on this page, and whether there's another page |
+| `query_words` | number of words in the query after whitespace is collapsed (keyword searches vs questions), not the words |
+| `corrected` | whether typo correction changed the query (the response's `corrected_query`) |
+| `filters` | names of the filters used, never their values |
+| `keyword_tier` | `all`: the keyword candidates all contain every query word. `any`: too few did, so resources with some of the words were added. `none`: no keyword terms (stop words only) |
+| `keyword_candidates`, `semantic_candidates` | candidates from each side before fusion (at most 100 each with the default settings). `semantic_candidates: 0` in hybrid mode means nothing was within the distance floor |
+| `scan_cap_hit` | a keyword tier matched more rows than it ranks (`scanCap`, [search.md](search.md#knobs)): a broad query, where which matches got ranked is arbitrary |
+| `duration_ms` | time in the handler, including the embedding call |
+
+**Zero-result rate** over the last 7 days:
+
+```sh
+gcloud logging read 'resource.type="cloud_run_revision" AND jsonPayload.event="search" AND jsonPayload.page="first"' \
+  --project=$PROJECT_ID --freshness=7d --format='value(jsonPayload.results)' \
+  | awk '{ n++; if ($1 == 0) z++ } END { printf "%d searches, %d without results (%.1f%%)\n", n, z, n ? 100 * z / n : 0 }'
+```
+
+For larger volumes, or a breakdown by sort, filters or mode, use Log Analytics (free once the `_Default` bucket is
+upgraded to use it):
+
+```sql
+SELECT
+  JSON_VALUE(json_payload.sort) AS sort,
+  JSON_VALUE(json_payload.mode) AS mode,
+  COUNT(*) AS searches,
+  COUNTIF(CAST(JSON_VALUE(json_payload.results) AS INT64) = 0) AS without_results,
+  APPROX_QUANTILES(CAST(JSON_VALUE(json_payload.duration_ms) AS INT64), 100)[OFFSET(95)] AS p95_ms
+FROM `PROJECT_ID.global._Default._AllLogs`
+WHERE JSON_VALUE(json_payload.event) = 'search'
+  AND JSON_VALUE(json_payload.page) = 'first'
+  AND timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+GROUP BY sort, mode
+ORDER BY searches DESC
+```
+
+Other questions the same lines answer: how deep people page (`next` vs `first`), which filters and sorts are used, and
+how many searches call the embedding API (`embedding="computed"`: one call each). For tuning the search
+([search.md](search.md#tuning-and-rollout)): the share of `scan_cap_hit`, `keyword_tier`, and searches with
+`semantic_candidates` 0 or `corrected` true.
+
+A `503 search_unavailable` (a later page whose query embedding failed) writes no `search` line, only
+`search_embedding_failed`.
 
 ## 4. Analytics on `chat_usage` and `chat_usage_daily`
 
@@ -183,6 +252,7 @@ Other things that affect the numbers:
 | Daily counts per identity type (no identifiers) | `chat_usage_daily` | indefinitely: aggregated, not personal data |
 | Visitor IP, **raw** | Cloud Run request logs (standard Google Cloud logging, not this code) | Cloud Logging retention (30 days by default) |
 | Chat messages and history | sent to Gemini (Vertex AI) to generate the answer; not stored by the API | — |
+| Search queries | not stored. The `search` log line ([§3b](#3b-search-logs)) has counts only: no query text, no identity | Cloud Logging retention (30 days by default) |
 
 **Points to be aware of:**
 - **The hashed IPs are still personal data.** Under GDPR, IP addresses are personal data, and a keyed hash is

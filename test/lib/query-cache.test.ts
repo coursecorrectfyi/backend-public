@@ -20,11 +20,37 @@ describe('QueryEmbeddingCache', () => {
     expect(embed).toHaveBeenCalledTimes(2)
   })
 
-  it('stores vectors as Float32Array (pgvector stores float4, so no precision that matters is lost)', async () => {
+  it('stores vectors as Float32Array (more precision than the halfvec column keeps)', async () => {
     const cache = new QueryEmbeddingCache(async () => [0.1, 0.2, 0.3])
     const vector = await cache.get('x')
     expect(vector).toBeInstanceOf(Float32Array)
     expect(Array.from(vector)).toEqual([Math.fround(0.1), Math.fround(0.2), Math.fround(0.3)])
+  })
+
+  it('has() tells whether get() would be answered without calling the API', async () => {
+    const embed = fakeEmbed()
+    const cache = new QueryEmbeddingCache(embed)
+    expect(cache.has('learn python')).toBe(false)
+    const pending = cache.get('learn python')
+    expect(cache.has('learn python')).toBe(true) // pending counts: get() would share it
+    await pending
+    expect(cache.has('learn python')).toBe(true)
+    expect(embed).toHaveBeenCalledTimes(1)
+  })
+
+  it('has() forgets a failed call (the next get() tries the API again)', async () => {
+    const cache = new QueryEmbeddingCache(async () => { throw new Error('503') })
+    await expect(cache.get('x')).rejects.toThrow('503')
+    expect(cache.has('x')).toBe(false)
+  })
+
+  it('has() does not count as a use for eviction', async () => {
+    const cache = new QueryEmbeddingCache(fakeEmbed(), { maxEntries: 2 })
+    await cache.get('a')
+    await cache.get('b')
+    cache.has('a')
+    await cache.get('c') // evicts the least recently used: still 'a'
+    expect([cache.has('a'), cache.has('b'), cache.has('c')]).toEqual([false, true, true])
   })
 
   it('shares one API call between identical requests arriving together', async () => {

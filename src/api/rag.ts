@@ -68,7 +68,17 @@ export async function retrieveForQuery(
   excludeIds: string[] = [],
 ): Promise<RetrievedResource[]> {
   const queryVector = await embedQuery(query)
-  const vectorLiteral = `[${queryVector.join(',')}]`
+  return retrievalQuery(queryVector, k, excludeIds)
+}
+
+/**
+ * The nearest-neighbour query itself (exported so tests can check its plan
+ * uses the HNSW index). k stays below hnsw.ef_search (40 by default), so the
+ * index scan returns all k rows.
+ */
+export function retrievalQuery(queryVector: ArrayLike<number>, k: number, excludeIds: string[] = []) {
+  // Uncast: the parameter takes the column's type (halfvec), so the HNSW index applies.
+  const vectorLiteral = `[${Array.from(queryVector).join(',')}]`
 
   const conditions = [
     eq(learning_resources.is_active, true),
@@ -76,7 +86,7 @@ export async function retrieveForQuery(
     ...(excludeIds.length > 0 ? [notInArray(learning_resources.id, excludeIds)] : []),
   ]
 
-  const rows = await db
+  return db
     .select({
       id:              learning_resources.id,
       title:           learning_resources.title,
@@ -99,8 +109,6 @@ export async function retrieveForQuery(
     .where(and(...conditions))
     // <=> is pgvector cosine distance (0 = identical, 2 = opposite).
     // ORDER BY ASC gives most similar first.
-    .orderBy(sql`${learning_resources.embedding} <=> ${vectorLiteral}::vector`)
+    .orderBy(sql`${learning_resources.embedding} <=> ${vectorLiteral}`)
     .limit(k)
-
-  return rows
 }

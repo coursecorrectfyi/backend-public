@@ -175,37 +175,54 @@ Header: `Authorization: Bearer <refreshToken>`. Returns a new pair: `200 { token
 ## Resources
 
 ### `GET /api/v1/resources/search`
-Hybrid full-text + semantic search over active resources.
+Search over active resources, by keywords and by meaning (semantic similarity). How it works:
+[search.md](search.md).
 
 | Query parameter | Description |
 |---|---|
-| `q` | **Required.** Plain-text query. Whitespace and line breaks are collapsed into single spaces, and a query over **200 characters** is cut quietly at the last word boundary before the limit (every word of the query has to match, so half a word would empty the results). Missing or blank: `400 { "error": "Missing required query parameter: q" }` |
+| `q` | **Required.** Plain-text query. Whitespace and line breaks are collapsed into single spaces, and a query over **200 characters** is cut quietly at the last word boundary before the limit. Missing or blank: `400 { "error": "Missing required query parameter: q" }` |
 | `limit` | Page size, default 20, clamped to 1–50 |
 | `sort` | `relevance` (default), `rating`, `most_reviewed`, `duration_asc`, `duration_desc`, `newest`. Unknown values are treated as `relevance` |
-| `cursor` | `next_cursor` from the previous page. Send it back unchanged, with the same `q`, `sort` and filters. A cursor that is malformed, longer than 1,000 characters, or was made for a different `sort`: `400 { "error": "Invalid cursor" }` |
+| `cursor` | `next_cursor` from the previous page. Send it back unchanged, with the same `q`, `sort` and filters |
 | `level` | Filter, repeatable (`?level=beginner&level=advanced`): `beginner`, `intermediate`, `advanced`, `all_levels` |
 | `resource_type` | Filter, repeatable: `course`, `program`, `degree`, `project`, `certification`, `code_along` |
 | `provider`, `language` | Filters, repeatable, any value (e.g. `coursera`, `en`) |
 | `is_free`, `has_certificate` | `true` or `false`. Other values are ignored |
 
+**What matches.** A resource matches if it contains the query's words or is close in meaning, within the filters.
+- Resources containing every word rank above those containing only some.
+- Words that say nothing about a topic in a course catalogue ("course", "best", "online", …) are ignored unless the
+  query has nothing else.
+- Query words that appear nowhere in the catalogue are replaced by the closest word that does (typos):
+  `corrected_query` then shows what was searched.
+- **At most about 200 results** per query, whatever the sort.
+
+**Sorts.** Every sort orders the same results as `relevance`; only the order changes.
+- `rating` orders by a weighted rating: a rating from few reviews counts for less (a Bayesian average), so a 4.8
+  from 20,000 ratings comes before a 5.0 from one.
+- NULL values (no rating, no duration) come last, in both directions.
+
 **Filter values:** empty values are ignored. Each filter takes at most **20** values of at most **50** characters.
 A filter value the API can't use is refused rather than ignored, because ignoring it would return results the client
-didn't ask for:
+didn't ask for.
 
 | Status | Body |
 |---|---|
 | 400 | `{ "error": "Invalid level: \"expert\"", "allowed": [...] }` (same for `resource_type`) |
 | 400 | `{ "error": "Too many provider values", "maxValues": 20 }` (for any filter) |
 | 400 | `{ "error": "A language value is too long", "maxLength": 50 }` (for any filter) |
+| 400 | `{ "error": "Invalid cursor" }`: the cursor is malformed, over 1,000 characters, made for a different `sort`, or from before this API version. Start again from page 1 |
+| 503 | `{ "error": "Search is temporarily unavailable", "code": "search_unavailable" }`: the next page can't be ranked the way the first page was, right now (see `vector_search`). Retry the same request a little later. Only on requests with a `cursor` |
 
-`200 { data, next_cursor, vector_search }`:
+`200 { data, next_cursor, vector_search, corrected_query }`:
 - `data`: resources with `id, provider, resource_type, provider_type, title, ai_summary, institution, language,
   level, duration_hours, rating, num_ratings, is_free, has_certificate, is_self_paced, skills, career_paths, url`.
 - `next_cursor`: string, or `null` on the last page.
-- `vector_search`: `true` when semantic similarity was part of the ranking. `false` when the results are ranked by
-  keyword relevance only because the semantic part was unavailable (e.g. slow or failing), and always `false` for
-  sorts other than `relevance`, which don't use semantic ranking. Which results match is decided by the keywords
-  either way: `vector_search` only changes the order within `sort=relevance`.
+- `vector_search`: `true` when similarity in meaning was part of finding and ranking the results. `false` when it was
+  unavailable (e.g. slow or failing), so the results come from the keywords only. The later pages of a search keep the
+  first page's mode, and a page that can't keep it gets `503` rather than a different order.
+- `corrected_query`: the query as searched, when words were corrected (e.g. `"python basics"` for `"pyhton basics"`),
+  for a "Showing results for …" line. Otherwise `null`.
 
 `429`: search group, see [Rate limits](#rate-limits).
 
@@ -343,8 +360,16 @@ Breaking changes:
   `400 { "error": "Invalid cursor" }` (previously: the first page, or a `500`). Unknown `level` / `resource_type`
   values, more than 20 values for a filter, or a value over 50 characters return `400` (previously: no results, or
   accepted without limit).
-- **`GET /api/v1/resources/search`: `vector_search` is `false` for sorts other than `relevance`** (previously `true`
-  whenever the embedding service was up, although those sorts never used it).
+- **`GET /api/v1/resources/search`: matching and ranking** ([details](#get-apiv1resourcessearch)):
+  - **What matches:** semantic matches are returned even without a shared word, resources matching only some words
+    are returned, and typos are corrected.
+  - **Sorts:** every sort orders the same results as relevance (previously each sort listed the resources containing
+    every word), and `rating` uses a weighted rating.
+  - **Result cap:** at most about 200 results per query.
+  - **`vector_search`** can be `true` for every sort.
+  - **Cursors** issued before this version get `400 { "error": "Invalid cursor" }`.
+  - **A new `503` with `code: "search_unavailable"`** can answer a request with a `cursor` when the next page can't be
+    ranked like the first one. Retry the same request.
 
 Other changes:
 - **Per-minute rate limits** per visitor: chat 10, search 60, login 20, and 120 shared by every other route
@@ -365,7 +390,9 @@ Other changes:
 - **CORS:** `Retry-After` is readable by browser code (previously hidden by the browser even though it was sent).
 - **`POST /api/v1/chat` can answer `503`** (`chat_unavailable`, `chat_signed_in_only`) when chat is switched off.
 - **`GET /api/v1/resources/search`: `q` is cut at 200 characters** (at a word boundary) and its whitespace collapsed
-  (previously unlimited). Searches sorted by anything but relevance are faster (no semantic step).
+  (previously unlimited).
+- **`GET /api/v1/resources/search`: new `corrected_query` field** (string or `null`): the query as searched when typos
+  were corrected.
 - **Subjects** (`/api/v1/subjects*`): responses carry `Cache-Control: public, max-age=300` (previously `no-store` on
   the list and nothing on the others). The list and tree now refresh every 10 minutes (previously only when the API
   restarted), and `/subjects/:slug` comes from the same copy (previously read live), so a taxonomy change shows up

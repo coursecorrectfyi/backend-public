@@ -19,9 +19,16 @@ import { sql } from 'drizzle-orm'
 
 // ─── Custom column types ──────────────────────────────────────────────────────
 
-const vector = customType<{ data: number[]; config: { dimensions: number } }>({
+/**
+ * pgvector `halfvec`: 16-bit floats, half the size of `vector` (float4). A
+ * 768-dimension embedding is ~1.5 KB, small enough to stay in the row
+ * instead of TOAST, and the HNSW index is half the size. Ranking is the same
+ * in practice (measured on the catalogue: docs/deployment-gcp.md, "halfvec").
+ * Written and read as text ('[0.1,0.2,…]'), like `vector`.
+ */
+const halfvec = customType<{ data: number[]; config: { dimensions: number } }>({
   dataType(config) {
-    return `vector(${config?.dimensions ?? 768})`
+    return `halfvec(${config?.dimensions ?? 768})`
   },
   toDriver(value: number[]) {
     return JSON.stringify(value)
@@ -254,11 +261,13 @@ export const learning_resources = pgTable('learning_resources', {
    */
   search_document: tsvector('search_document'),
   /**
-   * Vertex AI text-embedding-004, 768 dimensions.
+   * Vertex AI text-embedding-004, 768 dimensions, stored as halfvec.
    * Input: "{title} | {provider_type} | {institution} | {level} | {skills} | {ai_summary}"
-   * HNSW index (cosine) added manually in migration — Drizzle cannot express it.
+   * Queried by cosine distance through the HNSW index (lr_embedding_hnsw_idx).
+   * Compare it with an uncast parameter (`embedding <=> ${literal}`): the
+   * parameter then takes the column's type, and the index is used.
    */
-  embedding: vector('embedding', { dimensions: 768 }),
+  embedding: halfvec('embedding', { dimensions: 768 }),
 
   // ── URLs ─────────────────────────────────────────────────────────────────────
   /** Canonical provider URL. Used for SEO canonical tags and as click fallback. */
@@ -297,6 +306,7 @@ export const learning_resources = pgTable('learning_resources', {
   index('lr_has_certificate_idx').on(table.has_certificate),
   index('lr_last_seen_at_idx').on(table.last_seen_at),
   index('lr_is_active_idx').on(table.is_active),
+  index('lr_embedding_hnsw_idx').using('hnsw', table.embedding.op('halfvec_cosine_ops')),
 ])
 
 /**
@@ -480,4 +490,28 @@ export const saved_courses = pgTable('saved_courses', {
 }, (table) => [
   primaryKey({ columns: [table.user_id, table.resource_id] }),
   index('saved_courses_user_id_idx').on(table.user_id),
+])
+
+// ─── Search vocabulary ────────────────────────────────────────────────────────
+
+/**
+ * Every word in the active catalogue's text (title, summary, skills,
+ * institution), lowercase and unstemmed, with the number of active resources
+ * containing it. Search uses it to correct typos: a query word that isn't
+ * here matches nothing, so it's replaced by its closest frequent word
+ * (src/search/vocabulary.ts).
+ *
+ * Derived data, rebuilt in full by refreshVocabulary(): at the end of the
+ * embed job, or with `npm run search:vocabulary`. Empty until the first
+ * refresh, and then typo correction is off.
+ */
+export const search_vocabulary = pgTable('search_vocabulary', {
+  word: text('word').primaryKey(),
+  doc_count: integer('doc_count').notNull(),
+}, (table) => [
+  // Two ways to find candidate corrections: similar trigrams (pg_trgm), or the
+  // same first letter and a similar length (catches swapped letters, which
+  // trigrams miss: "pyhton" vs "python").
+  index('sv_word_trgm_idx').using('gin', table.word.op('gin_trgm_ops')),
+  index('sv_first_letter_length_idx').on(sql`left(${table.word}, 1)`, sql`length(${table.word})`),
 ])

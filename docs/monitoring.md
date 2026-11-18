@@ -365,6 +365,8 @@ Every event the API writes as a structured log (`jsonPayload.event`). Query them
 | `relay_auth_failed` | WARNING | once a minute per instance at most, with counts per problem | yes (§5) | [§6](deployment-gcp.md#trusted-relay-the-nextjs-server) |
 | `rate_limit_summary` | WARNING | once a minute per instance, when something went over a per-minute limit | floods only (§5) | [§6](deployment-gcp.md#rolling-out-the-per-minute-limits-shadow--enforce) |
 | `chat_answer` | INFO | per answered question: outcome, duration, tokens | no: dashboard and monthly review (§8) | [operations.md §3a](operations.md#3a-chat-answer-logs) |
+| `search` | INFO | per answered search: sort, ranking mode, embedding (cached or computed), page, result count, typo correction, filter names, candidates per side, whether the keyword scan cap was hit, duration. Never the query text | no: monthly review (zero-result rate, scan cap, p95 duration) | [operations.md §3b](operations.md#3b-search-logs) |
+| `search_vocabulary_refreshed` | INFO | once per embed job run (at its end) or `npm run search:vocabulary` | no | `words`, `duration_ms`. [search.md](search.md#operations) |
 | `auth_rejected` | INFO | per request with a bad token on `/saved` | no | reason = JWT error name, e.g. `JwtTokenExpired` |
 | `login_rejected` | INFO | per login refused by the sign-in rules | no | `reason` (`provider_not_allowed`, `email_not_verified`) and `provider`. Many for Google users after a release means `AUTH_ALLOWED_PROVIDERS` is wrong. [auth-providers.md](auth-providers.md) |
 | `chat_usage_retention` | INFO | once per daily retention run | no (a missing run shows in the monthly check, [operations.md §3](operations.md#3-regular-review-eg-monthly)) | `summary_rows`, `deleted_rows`, `retention_days` |
@@ -380,7 +382,8 @@ Every event the API writes as a structured log (`jsonPayload.event`). Query them
 | `chat_generation_failed` | Gemini failed or timed out during an answer. With `outcome` (`error` or `timeout`) |
 | `chat_rag_failed` | catalogue retrieval (embedding) failed; the answer continued without it |
 | `chat_usage_retention_failed` | the retention job failed (from the Cloud Run job, which then exits with an error). Also in the §5 alert |
-| `search_embedding_failed` | the search query couldn't be embedded in time (5 s) or at all; the search answered with keyword ranking only (`vector_search: false`) |
+| `search_embedding_failed` | the search query couldn't be embedded in time (5 s) or at all. On page 1 the search answered with keywords only (`vector_search: false`). On a later page of a search ranked with the embedding, it answered `503 search_unavailable` (the client retries) |
+| `search_vocabulary_failed` | rebuilding the search vocabulary failed (`npm run search:vocabulary`). In the embed job, a failure at that step fails the job (`unhandled_error`) after the embeddings were saved |
 | `chat_refund_failed` | giving back an unanswered question failed (the user lost one question) |
 
 And `chat_mode` (WARNING), once per instance start when `CHAT_MODE` isn't `on`, so you can see the switch took effect.

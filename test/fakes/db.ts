@@ -18,7 +18,16 @@ export const pg: PGlite = await singleton('pglite', () => {
   const snapshot = inject('pgliteSnapshotPath')
   return snapshot ? loadSnapshot(snapshot) : createMigratedDatabase()
 })
-export const db = singleton('drizzle', () => drizzle(pg, { schema }))
+/**
+ * Every statement the app sends through Drizzle (including inside
+ * transactions), for tests that EXPLAIN the real SQL. Cleared by resetDb().
+ */
+export const queryLog = singleton('queryLog', () => [] as Array<{ sql: string; params: unknown[] }>)
+
+export const db = singleton('drizzle', () => drizzle(pg, {
+  schema,
+  logger: { logQuery: (sql, params) => { queryLog.push({ sql, params }) } },
+}))
 export type DB = typeof db
 
 /** Production drains the connection pool; the in-process database needs no cleanup. */
@@ -33,6 +42,7 @@ export async function closeDb(): Promise<void> {}
  * identity to restart.
  */
 export async function resetDb(): Promise<void> {
+  queryLog.length = 0
   const tables = await singleton('tables', async () => {
     const { rows } = await pg.query<{ tablename: string }>(
       `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`,

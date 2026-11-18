@@ -50,6 +50,20 @@
       "when": 1794701986789,
       "tag": "0006_even_songbird",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1794886934476,
+      "tag": "0007_halfvec_embeddings",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794889765827,
+      "tag": "0008_search_vocabulary",
+      "breakpoints": true
     }
   ]
 }

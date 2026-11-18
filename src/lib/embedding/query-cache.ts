@@ -7,9 +7,9 @@
  *   query first (at most 200 characters), so keys are small.
  * - Least recently used entries are dropped beyond `maxEntries`: memory is
  *   bounded whatever the traffic. A vector is 768 × 4 bytes as a Float32Array
- *   (pgvector stores float4, so nothing is lost), about 3.5 KB per entry with
- *   its key: 2,000 entries ≈ 7 MB. A flood of unique queries can only evict
- *   useful entries, not grow the cache.
+ *   (more precision than the halfvec column keeps, so nothing that matters is
+ *   lost), about 3.5 KB per entry with its key: 2,000 entries ≈ 7 MB. A flood
+ *   of unique queries can only evict useful entries, not grow the cache.
  * - No expiry: the same model always returns the same vector, and changing the
  *   model means a deploy, which starts with an empty cache.
  * - Identical requests arriving together share one API call (the pending
@@ -50,6 +50,14 @@ export class QueryEmbeddingCache {
       if (this.entries.get(text) === pending) this.entries.delete(text)
     })
     return pending
+  }
+
+  /**
+   * Whether `text` is cached or being fetched (`get` would not call the API).
+   * Doesn't count as a use for the least-recently-used order.
+   */
+  has(text: string): boolean {
+    return this.entries.has(text)
   }
 
   get size(): number {
