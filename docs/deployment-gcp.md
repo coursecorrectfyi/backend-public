@@ -35,7 +35,7 @@ done
 
 ### Database
 
-Create a PostgreSQL instance with the `vector` extension available (Cloud SQL supports pgvector), a database and an application user. The application user needs to be able to create objects in the `public` schema:
+Create a PostgreSQL instance with the `vector` extension available, **pgvector 0.8 or later** (Cloud SQL supports pgvector), a database and an application user. The application user needs to be able to create objects in the `public` schema:
 
 ```sql
 GRANT CREATE ON SCHEMA public TO <app_user>;
@@ -84,6 +84,81 @@ version still serves traffic, and a rollback goes back to that version, so both 
   default. First release the code that no longer uses the old form, then the migration that removes it.
 - Large tables: a plain `CREATE INDEX` locks writes while it builds. `CREATE INDEX CONCURRENTLY` doesn't, but it
   can't run inside the migration transaction, so run it by hand first and make the migration `CREATE INDEX IF NOT EXISTS`.
+
+### The halfvec migration (0007)
+
+`0007_halfvec_embeddings` stores embeddings as `halfvec(768)` (16-bit floats) instead of `vector(768)`. Measured on a
+copy of the catalogue (~74k resources):
+- HNSW index 288 → 144 MB, table 833 → 538 MB; embeddings are stored in the row instead of TOAST;
+- search after a restart (cold cache) about 2× faster on a 1 GB VM, warm unchanged;
+- the same results: for 10 query vectors, all 60 of the top-6 chat retrieval results were identical.
+
+At ~150k resources the `vector` index would be ~580 MB (more than a 1 GB VM can cache), the `halfvec` one ~290 MB.
+
+**It rewrites the table and rebuilds all of its indexes under an exclusive lock.** Search, course pages and chat wait
+until it's done: minutes on a small VM, mostly the HNSW build. So it isn't applied to the live database. It runs on the
+new VM between restore and switch:
+
+1. **Restore the dump.** Optionally, leave out the old HNSW index, which the migration would drop straight away
+   (saves one full index build):
+
+   ```sh
+   pg_restore --list cloudsql.dump | grep -v 'learning_resources_embedding_idx' > restore.list
+   pg_restore --dbname="$VM_DATABASE_URL" --no-owner --use-list=restore.list cloudsql.dump
+   ```
+
+   The dump includes `drizzle.__drizzle_migrations`, so the next step applies only 0007 (and any later migration).
+2. **Give the index build enough memory**, so the HNSW graph is built in memory (pgvector prints a notice when it
+   doesn't fit, and the build gets much slower). About 256 MB is enough for 74k resources:
+
+   ```sql
+   ALTER DATABASE <db> SET maintenance_work_mem = '256MB';  -- new sessions, including the migration's
+   ```
+
+3. **Apply the migrations** as usual (`npx drizzle-kit migrate` with the VM's `DATABASE_URL`): `0007`, and `0008`
+   ([the search vocabulary](#the-search-vocabulary-0008)). Then fill the vocabulary, undo step 2, and refresh the
+   planner statistics, which a restore doesn't bring along:
+
+   ```sh
+   DATABASE_URL="$VM_DATABASE_URL" npm run search:vocabulary
+   ```
+
+   ```sql
+   ALTER DATABASE <db> RESET maintenance_work_mem;
+   ANALYZE;
+   ```
+
+4. **Check:**
+
+   ```sql
+   SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+   WHERE attrelid = 'learning_resources'::regclass AND attname = 'embedding';             -- halfvec(768)
+   SELECT indexname, pg_size_pretty(pg_relation_size(indexname::regclass)) FROM pg_indexes
+   WHERE tablename = 'learning_resources' AND indexdef LIKE '%USING hnsw%';               -- lr_embedding_hnsw_idx, ~144 MB
+   ```
+
+5. **Switch the API** to the VM.
+
+**Either release order works** (both checked in `test/db/halfvec.test.ts`):
+- Releases before this one cast the query vector to `vector`. Postgres converts it to `halfvec` implicitly and uses the
+  new index, so an older release can run against the migrated database, and rolling back to one is safe.
+- From this release on, the query vector is passed uncast and takes the column's type, so this release also works on
+  a database without the migration (Cloud SQL), with its `vector` index.
+
+If it ever has to run on a live database: plan a maintenance window, or do it over two releases without the long
+lock. Add a `halfvec` column, backfill it in batches, build its index with `CREATE INDEX CONCURRENTLY`, switch the
+code, then drop the old column.
+
+### The search vocabulary (0008)
+
+`0008_search_vocabulary` creates the `pg_trgm` and `fuzzystrmatch` extensions and the `search_vocabulary` table,
+which search uses to correct typos ([search.md](search.md#operations)).
+- **Extensions:** both ship with Postgres (contrib: `postgresql-contrib`/PGDG packages, and Cloud SQL) and are
+  *trusted*, so a user with `CREATE` on the database can create them. On Cloud SQL, if the application user can't, run
+  the two `CREATE EXTENSION` lines as `postgres` first (they're `IF NOT EXISTS`).
+- **Safe while the previous release runs:** it only adds an empty table.
+- **After applying it**, fill the table: `npm run search:vocabulary` (seconds). The embed job refreshes it at the end
+  of every run. Until the first refresh, typo correction is simply off.
 
 ### Secrets
 
@@ -151,7 +226,11 @@ gcloud run jobs execute embedder --region=$REGION --project=$PROJECT_ID
 gcloud run jobs execute embedder --region=$REGION --project=$PROJECT_ID --update-env-vars=DRY_RUN_LIMIT=20
 ```
 
-- **`embedder`** fills `learning_resources.embedding` for rows where it is `NULL`, then exits. Run it after new resources are added.
+- **`embedder`** fills `learning_resources.embedding` for rows where it is `NULL`. It then rebuilds the search
+  vocabulary (typo correction; not in a dry run) and exits. Run it after new resources are added. Order after an
+  ingestion: ingestion → `embedder` → `insights-batch` (optional). It needs migrations `0007` and `0008`. To rebuild
+  only the vocabulary (e.g. after deactivating resources), run `npm run search:vocabulary` from a machine that reaches
+  the database.
 - **`insights-batch`** generates `ai_insights` for the top-ranked resources (`rating × ln(num_ratings + 1)`) that don't have them yet.
 - **`chat-usage-retention`** keeps `chat_usage` (daily chat counters, which hold pseudonymous identifiers) to the last
   7 days. It first saves each completed day's totals to `chat_usage_daily` (counts only), then deletes older rows, in

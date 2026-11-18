@@ -5,7 +5,9 @@ import { resetDb } from '../fakes/db.js'
 import { embedQuery, unitVector, vec } from '../fakes/embedding.js'
 import { insertResource, insertResources } from '../helpers/fixtures.js'
 import { captureLogs, errorLogs } from '../helpers/logs.js'
-import { LEVELS, RESOURCE_TYPES, SEARCH_LIMITS } from '../../src/api/resources.js'
+import { SEARCH_LIMITS } from '../../src/api/resources.js'
+import { LEVELS, RESOURCE_TYPES } from '../../src/search/filters.js'
+import { SEARCH_CONFIG } from '../../src/search/config.js'
 
 beforeEach(resetDb)
 
@@ -134,16 +136,33 @@ describe('GET /api/v1/resources/search: hybrid ranking', () => {
     const app = await loadApp()
     const far = await insertResource({ title: 'Python Course', embedding: unitVector(1) })
     const near = await insertResource({ title: 'Python Course', embedding: unitVector(0) })
-    const noEmbedding = await insertResource({ title: 'Python Course', embedding: null })
     embedQuery.mockResolvedValue(unitVector(0))
-
-    const body = await search(app, 'q=python')
-    expect(body.data.map(r => r.id)).toEqual([near.id, ...[far.id, noEmbedding.id].sort()])
+    // Whatever their keyword ranks (equal text: the id decides), near is also the top
+    // semantic match, and far is beyond the distance floor.
+    expect((await search(app, 'q=python')).data.map(r => r.id)).toEqual([near.id, far.id])
   })
 
-  it('still requires a keyword match: vector similarity alone does not return a resource', async () => {
+  it('a resource without an embedding yet counts its keyword rank for the semantic side too', async () => {
+    const app = await loadApp()
+    // Best keyword match (title), but the embedding job hasn't run for it.
+    const titleMatch = await insertResource({ title: 'Python', embedding: null })
+    // Weaker keyword match (summary), but the closest semantic match.
+    const summaryMatch = await insertResource({ title: 'Intro', ai_summary: 'Learn python', embedding: unitVector(0) })
+    embedQuery.mockResolvedValue(unitVector(0))
+    // Plain rank fusion would put summaryMatch first (found by both sides).
+    expect((await search(app, 'q=python')).data.map(r => r.id)).toEqual([titleMatch.id, summaryMatch.id])
+  })
+
+  it('returns a semantic match that has no word in common with the query', async () => {
     const app = await loadApp()
     await insertResource({ title: 'Gardening', embedding: unitVector(0) })
+    embedQuery.mockResolvedValue(unitVector(0))
+    expect(titles(await search(app, 'q=python'))).toEqual(['Gardening'])
+  })
+
+  it('does not return a resource beyond the semantic distance floor (no keyword match either)', async () => {
+    const app = await loadApp()
+    await insertResource({ title: 'Gardening', embedding: unitVector(1) }) // cosine distance 1 from the query
     embedQuery.mockResolvedValue(unitVector(0))
     expect((await search(app, 'q=python')).data).toEqual([])
   })
@@ -238,18 +257,21 @@ describe('GET /api/v1/resources/search: sorting and cursor pagination', () => {
   ]
 
   const byIdAsc = (a: Row, b: Row) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-  const nullsLast = (key: 'rating' | 'num_ratings' | 'duration_hours', dir: 1 | -1) => (a: Row, b: Row) => {
-    const x = a[key], y = b[key]
+  // sort=rating orders by the weighted (Bayesian) rating, computed here independently of the code.
+  const { priorMean, priorCount } = SEARCH_CONFIG.rating
+  const weighted = (r: Row) => r.rating === null ? null : ((r.num_ratings ?? 0) * r.rating + priorCount * priorMean) / ((r.num_ratings ?? 0) + priorCount)
+  const nullsLast = (value: (r: Row) => number | null, dir: 1 | -1) => (a: Row, b: Row) => {
+    const x = value(a), y = value(b)
     if (x === null && y === null) return byIdAsc(a, b)
     if (x === null) return 1
     if (y === null) return -1
     return x !== y ? (x - y) * dir : byIdAsc(a, b)
   }
   const comparators: Record<string, (a: Row, b: Row) => number> = {
-    rating: nullsLast('rating', -1),
-    most_reviewed: nullsLast('num_ratings', -1),
-    duration_asc: nullsLast('duration_hours', 1),
-    duration_desc: nullsLast('duration_hours', -1),
+    rating: nullsLast(weighted, -1),
+    most_reviewed: nullsLast(r => r.num_ratings, -1),
+    duration_asc: nullsLast(r => r.duration_hours, 1),
+    duration_desc: nullsLast(r => r.duration_hours, -1),
     newest: (a, b) => b.created_at.getTime() - a.created_at.getTime() || byIdAsc(a, b),
   }
 
@@ -374,14 +396,19 @@ describe('GET /api/v1/resources/search: cursor validation', () => {
   const encode = (payload: unknown) => Buffer.from(JSON.stringify(payload)).toString('base64url')
   const ID = '3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a60'
 
+  const TS = '2025-01-01T00:00:03.123456Z'
+  const v2 = (sort: string, values: unknown[], extra: Record<string, unknown> = {}) =>
+    ({ v: 2, sort, mode: 'hybrid', values, id: ID, ...extra })
+
   it.each([
-    ['relevance', { sort: 'relevance', id: ID, score: 0.5 }],
-    ['rating', { sort: 'rating', id: ID, rating: 4.5 }],
-    ['rating', { sort: 'rating', id: ID, rating: null }],
-    ['most_reviewed', { sort: 'most_reviewed', id: ID, num_ratings: 100 }],
-    ['duration_asc', { sort: 'duration_asc', id: ID, duration_hours: null }],
-    ['duration_desc', { sort: 'duration_desc', id: ID, duration_hours: 2.5 }],
-    ['newest', { sort: 'newest', id: ID, created_at: '2025-01-01T00:00:03.000Z' }],
+    ['relevance', v2('relevance', [0.032, 4.61])],
+    ['relevance', v2('relevance', [0.016, null], { mode: 'keyword' })],
+    ['rating', v2('rating', [4.5])],
+    ['rating', v2('rating', [null])],
+    ['most_reviewed', v2('most_reviewed', [100])],
+    ['duration_asc', v2('duration_asc', [null])],
+    ['duration_desc', v2('duration_desc', [2.5])],
+    ['newest', v2('newest', [TS])],
   ])('accepts a well-formed %s cursor', async (sort, payload) => {
     const app = await loadApp()
     const res = await app.get(`/api/v1/resources/search?q=python&sort=${sort}&cursor=${encode(payload)}`)
@@ -390,17 +417,28 @@ describe('GET /api/v1/resources/search: cursor validation', () => {
 
   it.each([
     // The probes from the abuse report (P5): these used to reach Postgres and return 500
-    ['a non-UUID id', 'relevance', { sort: 'relevance', id: 'x', score: 0.5 }],
-    ['a missing score', 'relevance', { sort: 'relevance', id: ID }],
-    ['an invalid created_at', 'newest', { sort: 'newest', id: ID, created_at: 'yesterday' }],
+    ['a non-UUID id', 'relevance', v2('relevance', [0.5, null], { id: 'x' })],
+    ['a missing score', 'relevance', v2('relevance', [])],
+    ['an invalid created_at', 'newest', v2('newest', ['yesterday'])],
+    // Cursors from before version 2 (the ranking mode wasn't recorded): the frontend offers to reload
+    ['a version 1 relevance cursor', 'relevance', { sort: 'relevance', id: ID, score: 0.5 }],
+    ['a version 1 newest cursor', 'newest', { sort: 'newest', id: ID, created_at: '2025-01-01T00:00:03.000Z' }],
     // and the other ways a cursor can be wrong
-    ['a score that is a string', 'relevance', { sort: 'relevance', id: ID, score: '0.5; DROP TABLE' }],
-    ['a fractional num_ratings', 'most_reviewed', { sort: 'most_reviewed', id: ID, num_ratings: 1.5 }],
-    ['a rating that is a string', 'rating', { sort: 'rating', id: ID, rating: '4.5' }],
-    ['a duration that is not a number', 'duration_asc', { sort: 'duration_asc', id: ID, duration_hours: '10h' }],
-    ['a created_at Postgres might misread', 'newest', { sort: 'newest', id: ID, created_at: '01/02/2025' }],
-    ['a cursor made for another sort', 'newest', { sort: 'rating', id: ID, rating: 4 }],
-    ['a relevance cursor used with an unknown sort (which means relevance) is fine, but a rating one is not', 'bogus', { sort: 'rating', id: ID, rating: 4 }],
+    ['another version', 'relevance', v2('relevance', [0.5, null], { v: 3 })],
+    ['a missing mode', 'relevance', v2('relevance', [0.5, null], { mode: undefined })],
+    ['an unknown mode', 'relevance', v2('relevance', [0.5, null], { mode: 'semantic' })],
+    ['values that are not a list', 'rating', v2('rating', [], { values: 4.5 })],
+    ['too many values', 'rating', v2('rating', [4.5, 1])],
+    ['a null score (relevance scores are never null)', 'relevance', v2('relevance', [null, 4.5])],
+    ['a score that is a string', 'relevance', v2('relevance', ['0.5; DROP TABLE', null])],
+    ['a fractional num_ratings', 'most_reviewed', v2('most_reviewed', [1.5])],
+    ['a rating that is a string', 'rating', v2('rating', ['4.5'])],
+    ['a duration that is not a number', 'duration_asc', v2('duration_asc', ['10h'])],
+    ['a created_at without microseconds', 'newest', v2('newest', ['2025-01-01T00:00:03.000Z'])],
+    ['a created_at Postgres might misread', 'newest', v2('newest', ['01/02/2025'])],
+    ['a null created_at', 'newest', v2('newest', [null])],
+    ['a cursor made for another sort', 'newest', v2('rating', [4])],
+    ['a relevance cursor used with an unknown sort (which means relevance) is fine, but a rating one is not', 'bogus', v2('rating', [4])],
     ['a JSON array', 'relevance', [1, 2]],
     ['JSON null', 'relevance', null],
   ])('returns 400 for %s, without calling the embedding API', async (_label, sort, payload) => {
@@ -409,6 +447,12 @@ describe('GET /api/v1/resources/search: cursor validation', () => {
     expect(res.status).toBe(400)
     expect(await res.json()).toEqual({ error: 'Invalid cursor' })
     expect(embedQuery).not.toHaveBeenCalled()
+  })
+
+  it('accepts a relevance cursor with an unknown sort (which means relevance)', async () => {
+    const app = await loadApp()
+    const res = await app.get(`/api/v1/resources/search?q=python&sort=bogus&cursor=${encode(v2('relevance', [0.5, null]))}`)
+    expect(res.status).toBe(200)
   })
 
   it('returns 400 for a cursor over 1,000 characters', async () => {
@@ -436,15 +480,25 @@ describe('GET /api/v1/resources/search: embedding calls', () => {
   })
 
   it.each(['rating', 'most_reviewed', 'duration_asc', 'duration_desc', 'newest'])(
-    'does not embed the query for sort=%s (only relevance ranking uses it)', async sort => {
+    'embeds the query for sort=%s too (every sort orders the same results), reusing the cached embedding', async sort => {
       const app = await loadApp()
       await insertResources([{ title: 'Python' }])
+      await search(app, 'q=python') // the frontend's default sort comes first
       const body = await search(app, `q=python&sort=${sort}`)
       expect(titles(body)).toEqual(['Python'])
-      expect(body.vector_search).toBe(false)
-      expect(embedQuery).not.toHaveBeenCalled()
+      expect(body.vector_search).toBe(true)
+      expect(embedQuery).toHaveBeenCalledTimes(1)
     },
   )
+
+  it('falls back to keyword-only for other sorts too when the embedding fails', async () => {
+    const app = await loadApp()
+    await insertResources([{ title: 'Python' }])
+    embedQuery.mockRejectedValue(new Error('Vertex AI embedding API 503'))
+    const body = await search(app, 'q=python&sort=newest')
+    expect(titles(body)).toEqual(['Python'])
+    expect(body.vector_search).toBe(false)
+  })
 
   it('falls back to keyword-only on a timeout, logs it, and tries the API again on the next search', async () => {
     const app = await loadApp()
@@ -460,6 +514,81 @@ describe('GET /api/v1/resources/search: embedding calls', () => {
 
     expect((await search(app, 'q=python')).vector_search).toBe(true) // the failure wasn't cached
     expect(embedQuery).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('GET /api/v1/resources/search: search log event', () => {
+  const searchEvents = (entries: Array<Record<string, unknown>>) => entries.filter(e => e.event === 'search')
+
+  it('logs one line per search with counts only, never the query text', async () => {
+    const app = await loadApp()
+    await insertResources([{ title: 'Python Basics' }, { title: 'Python Advanced' }, { title: 'Python Data' }])
+    const logs = captureLogs()
+    const body = await search(app, 'q=My%20Secret%20python&limit=2&level=beginner&provider=coursera&is_free=true&is_free=maybe')
+    const [event, ...others] = searchEvents(logs())
+    expect(others).toEqual([])
+    expect(event).toEqual({
+      level: 'info', severity: 'INFO', ts: expect.any(String),
+      event: 'search', sort: 'relevance', mode: 'hybrid', embedding: 'computed', page: 'first',
+      results: body.data.length, has_more: false, query_words: 3, corrected: false,
+      filters: ['level', 'provider', 'is_free'],
+      keyword_tier: 'any', keyword_candidates: 0, semantic_candidates: 0, scan_cap_hit: false,
+      duration_ms: expect.any(Number),
+    })
+    expect(JSON.stringify(logs())).not.toMatch(/secret|python|coursera|beginner/i)
+  })
+
+  it('reports the zero-result case, paging, the cache and the ranking mode', async () => {
+    const app = await loadApp()
+    await insertResources(Array.from({ length: 3 }, (_, i) => ({ title: `Python ${i}` })))
+    const logs = captureLogs()
+    const page1 = await search(app, 'q=python&limit=2')
+    await search(app, `q=python&limit=2&cursor=${page1.next_cursor}`)
+    await search(app, 'q=gardening')
+    await search(app, 'q=python&sort=rating')
+    embedQuery.mockRejectedValueOnce(new Error('Vertex AI embedding API 503'))
+    const keywordPage1 = await search(app, 'q=python%20rust&limit=2')
+    await search(app, `q=python%20rust&limit=2&cursor=${keywordPage1.next_cursor}`) // continues without embedding
+
+    const pick = ({ sort, mode, embedding, page, results, has_more }: Record<string, unknown>) =>
+      ({ sort, mode, embedding, page, results, has_more })
+    expect(searchEvents(logs()).map(pick)).toEqual([
+      { sort: 'relevance', mode: 'hybrid', embedding: 'computed', page: 'first', results: 2, has_more: true },
+      { sort: 'relevance', mode: 'hybrid', embedding: 'cached', page: 'next', results: 1, has_more: false },
+      { sort: 'relevance', mode: 'hybrid', embedding: 'computed', page: 'first', results: 0, has_more: false },
+      { sort: 'rating', mode: 'hybrid', embedding: 'cached', page: 'first', results: 3, has_more: false },
+      { sort: 'relevance', mode: 'keyword', embedding: 'failed', page: 'first', results: 2, has_more: true },
+      { sort: 'relevance', mode: 'keyword', embedding: 'not_needed', page: 'next', results: 1, has_more: false },
+    ])
+  })
+
+  it('reports the keyword tier and the candidates from each side', async () => {
+    const app = await loadApp()
+    await insertResources([
+      { title: 'Python Data', embedding: unitVector(0) },
+      { title: 'Python Web', embedding: unitVector(1) }, // beyond the semantic distance floor
+      { title: 'Gardening', embedding: unitVector(0) }, // semantic only
+    ])
+    embedQuery.mockResolvedValue(unitVector(0))
+    const logs = captureLogs()
+    await search(app, 'q=python') // one term: the "all words" tier is all there is
+    await search(app, 'q=python%20data') // "all words" finds 1 of the 100 wanted: "any word" adds the rest
+    await search(app, 'q=how%20to') // stop words only: no keyword terms
+    const pick = ({ keyword_tier, keyword_candidates, semantic_candidates, scan_cap_hit }: Record<string, unknown>) =>
+      ({ keyword_tier, keyword_candidates, semantic_candidates, scan_cap_hit })
+    expect(searchEvents(logs()).map(pick)).toEqual([
+      { keyword_tier: 'all', keyword_candidates: 2, semantic_candidates: 2, scan_cap_hit: false },
+      { keyword_tier: 'any', keyword_candidates: 2, semantic_candidates: 2, scan_cap_hit: false },
+      { keyword_tier: 'none', keyword_candidates: 0, semantic_candidates: 2, scan_cap_hit: false },
+    ])
+  })
+
+  it('does not log refused requests (400): they were never searched', async () => {
+    const app = await loadApp()
+    const logs = captureLogs()
+    expect((await app.get('/api/v1/resources/search?q=python&level=expert')).status).toBe(400)
+    expect((await app.get('/api/v1/resources/search?q=python&cursor=bogus')).status).toBe(400)
+    expect(searchEvents(logs())).toEqual([])
   })
 })
 

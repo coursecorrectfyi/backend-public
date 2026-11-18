@@ -12,11 +12,16 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PGlite } from '@electric-sql/pglite'
 import { vector } from '@electric-sql/pglite/vector'
+import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm'
+import { fuzzystrmatch } from '@electric-sql/pglite/contrib/fuzzystrmatch'
 
 const MIGRATIONS_DIR = fileURLToPath(new URL('../../migrations/', import.meta.url))
 const PGLITE_VERSION = (JSON.parse(
   readFileSync(fileURLToPath(new URL('../../node_modules/@electric-sql/pglite/package.json', import.meta.url)), 'utf8'),
 ) as { version: string }).version
+
+/** The Postgres extensions the migrations create (production: pgvector, and contrib's pg_trgm and fuzzystrmatch). */
+const EXTENSIONS = { vector, pg_trgm, fuzzystrmatch }
 
 function migrationFiles(): string[] {
   const journal = JSON.parse(readFileSync(join(MIGRATIONS_DIR, 'meta/_journal.json'), 'utf8')) as {
@@ -26,7 +31,7 @@ function migrationFiles(): string[] {
 }
 
 /**
- * A new PGlite cluster with pgvector and every migration applied.
+ * A new PGlite cluster with the extensions and every migration applied.
  *
  * Migrations run through exec() rather than drizzle's migrator: the first
  * migration has a hand-written statement before its first statement-breakpoint.
@@ -35,14 +40,14 @@ function migrationFiles(): string[] {
  * runs the files exactly as written.
  */
 export async function createMigratedDatabase(): Promise<PGlite> {
-  const pg = await PGlite.create({ extensions: { vector } })
+  const pg = await PGlite.create({ extensions: EXTENSIONS })
   for (const file of migrationFiles()) await pg.exec(readFileSync(file, 'utf8'))
   return pg
 }
 
 /** Loads a snapshot written by buildSnapshot(). */
 export async function loadSnapshot(path: string): Promise<PGlite> {
-  return PGlite.create({ extensions: { vector }, loadDataDir: new Blob([readFileSync(path)]) })
+  return PGlite.create({ extensions: EXTENSIONS, loadDataDir: new Blob([readFileSync(path)]) })
 }
 
 /**

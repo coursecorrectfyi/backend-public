@@ -5,6 +5,10 @@
  * For each row, builds the embedding input string, calls Vertex AI
  * text-embedding-004 in batches, and writes the 768-dim vector back to the DB.
  *
+ * Then rebuilds the search vocabulary (typo correction, src/search/vocabulary.ts)
+ * from the catalogue, so new resources' words are known to search. Not in a
+ * dry run.
+ *
  * Design:
  *   - Keyset pagination keeps memory bounded.
  *   - API calls are batched (up to 100 per request) to minimise latency.
@@ -30,6 +34,7 @@ import { isNull, eq, and, gt, asc } from 'drizzle-orm'
 import { db, closeDb } from '../db/client.js'
 import { learning_resources } from '../db/schema.js'
 import { log } from '../lib/logger.js'
+import { refreshVocabulary } from '../search/vocabulary.js'
 import {
   buildEmbeddingInput,
   embedBatch,
@@ -102,6 +107,14 @@ async function main() {
   }
 
   log({ event: 'embedding_job_complete', total_processed: totalProcessed, ...counts })
+
+  if (dryRunLimit) {
+    log({ event: 'search_vocabulary_skipped', reason: 'dry run' })
+  } else {
+    const startedAt = Date.now()
+    const { words } = await refreshVocabulary(db)
+    log({ event: 'search_vocabulary_refreshed', words, duration_ms: Date.now() - startedAt })
+  }
   await closeDb()
 }
 

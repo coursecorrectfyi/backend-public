@@ -11,6 +11,9 @@
 import { vi } from 'vitest'
 import { singleton } from '../helpers/singleton.js'
 
+/** Schema constants are plain data: the real ones (used by the search eval's judge schema). */
+export const { Type } = await vi.importActual<typeof import('@google/genai')>('@google/genai')
+
 export interface GenerateContentRequest {
   model: string
   contents: Array<{ role: string; parts: Array<{ text: string }> }>

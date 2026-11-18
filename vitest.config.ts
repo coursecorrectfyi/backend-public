@@ -22,7 +22,7 @@ export default defineConfig({
     testTimeout: 20_000,
     coverage: {
       provider: 'v8',
-      include: ['src/index.ts', 'src/api/**/*.ts', 'src/lib/**/*.ts', 'src/jobs/chat-usage-retention.ts'],
+      include: ['src/index.ts', 'src/api/**/*.ts', 'src/lib/**/*.ts', 'src/search/**/*.ts', 'src/jobs/chat-usage-retention.ts', 'src/jobs/search-vocabulary.ts'],
       reporter: ['text', 'html', 'lcov'],
       reportsDirectory: 'coverage',
     },
