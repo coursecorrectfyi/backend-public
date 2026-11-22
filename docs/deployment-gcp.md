@@ -422,17 +422,17 @@ X-Visitor-IP:   <the visitor's IP: on Cloud Run, the LAST entry of the X-Forward
 The API uses `X-Visitor-IP` only with a valid secret. A call without the headers counts as the server's own IP.
 
 **Create the secret** (once). It is stored twice: `trusted-relay-secrets` is what the API accepts (one value, or two
-while rotating), `relay-secret` is what the frontend sends (always exactly one value). Normally both hold the same value.
+while rotating), `api-relay-secret` is what the frontend sends (always exactly one value). Normally both hold the same value.
 
 ```sh
 RELAY_SECRET="$(openssl rand -base64 48 | tr -d '\n')"
 printf '%s' "$RELAY_SECRET" | gcloud secrets create trusted-relay-secrets --data-file=- --project=$PROJECT_ID
-printf '%s' "$RELAY_SECRET" | gcloud secrets create relay-secret --data-file=- --project=$PROJECT_ID
+printf '%s' "$RELAY_SECRET" | gcloud secrets create api-relay-secret --data-file=- --project=$PROJECT_ID
 unset RELAY_SECRET
 # The API reads trusted-relay-secrets as TRUSTED_RELAY_SECRETS (cloudbuild.api.yaml, _SECRETS).
-# The frontend's Cloud Run service gets relay-secret as a server-only env var, e.g.:
+# The frontend's Cloud Run service gets api-relay-secret as a server-only env var, e.g.:
 gcloud run services update <frontend-service> --region=$REGION --project=$PROJECT_ID \
-  --update-secrets=API_RELAY_SECRET=relay-secret:latest
+  --update-secrets=API_RELAY_SECRET=api-relay-secret:latest
 ```
 
 Each service's service account needs `roles/secretmanager.secretAccessor` on its secret. A new secret version only
@@ -441,7 +441,7 @@ reaches a service with a new revision (deploy, or `gcloud run services update`).
 **Rotate** (e.g. once a year, or at once if it may have leaked), without downtime:
 1. The API accepts both: `printf '%s %s' "$NEW" "$OLD" | gcloud secrets versions add trusted-relay-secrets --data-file=-`,
    then roll the API (`gcloud run services update <service> --region=$REGION --project=$PROJECT_ID`).
-2. The frontend sends the new one: `printf '%s' "$NEW" | gcloud secrets versions add relay-secret --data-file=-`,
+2. The frontend sends the new one: `printf '%s' "$NEW" | gcloud secrets versions add api-relay-secret --data-file=-`,
    then roll the frontend.
 3. The API drops the old one: `printf '%s' "$NEW" | gcloud secrets versions add trusted-relay-secrets --data-file=-`,
    then roll the API again. Check there's no `relay_auth_failed` afterwards.
@@ -589,7 +589,7 @@ doesn't include `google.com`. (The token is a credential: don't paste it anywher
 **Check 5: relayed calls count per visitor** (once the frontend sends the relay headers). Watch the logs for a day:
 there should be no `relay_auth_failed`, and no `rate_limit_summary` lines with `clients: 1` and a high `max_per_client`
 for routes the Next.js server calls. To test the API side directly in enforce mode, with the secret in your shell
-(`RELAY_SECRET="$(gcloud secrets versions access latest --secret=relay-secret --project=$PROJECT_ID)"`):
+(`RELAY_SECRET="$(gcloud secrets versions access latest --secret=api-relay-secret --project=$PROJECT_ID)"`):
 
 ```sh
 # 121 relayed calls, each for a different visitor: all 200 (each visitor has its own budget of 120)
