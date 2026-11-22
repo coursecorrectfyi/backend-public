@@ -17,6 +17,13 @@ What's left needs production data:
   `src/search/config.ts`, and performance on the VM. In order: [search.md, "Tuning and rollout"](search.md#tuning-and-rollout).
 - **Possible code changes,** if the measurements call for them (broad queries, the distance floor, false typo
   corrections, a quality prior, `lr_is_active_idx`, latency): [search.md](search.md#when-a-measurement-calls-for-a-code-change).
+- **Typos that the catalogue itself contains aren't corrected.** Typo correction only replaces words that appear in no
+  active resource (`src/search/vocabulary.ts`). "pyhton" appears in two (a course title misspells it), so
+  `pyhton basics` isn't corrected and gets no `corrected_query`; semantic search still finds some Python courses.
+  **Direction:** also treat a known word as a typo when it's rare and a much more common word is within the allowed
+  edits, e.g. the word is in at most 3 resources and the candidate in at least 100 times as many ("pyhton" 2 →
+  "python" 5,675). Two settings in `SEARCH_CONFIG.typos`, tests for both sides: a common typo is corrected; a rare
+  real word with no dominant neighbour is left alone. Check the evaluation set for false corrections.
 - **Query syntax** (quotes for phrases, `-word` to exclude) isn't supported. Only worth adding if users try it.
 - **"free" in a query** is ignored as a generic word. It could set the `is_free` filter instead, as "beginner" could
   set `level`. The search log doesn't record query text, so how often people type such words is unknown. A privacy-safe
