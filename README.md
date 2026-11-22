@@ -70,7 +70,7 @@ The batch jobs' insights provider is already switchable (`INSIGHTS_PROVIDER`: Ve
 
 ## Getting started
 
-Requirements: Node.js 22 (as in the Docker images), PostgreSQL 15+ with the [pgvector](https://github.com/pgvector/pgvector) extension (0.8+), and a Google Cloud project with Vertex AI enabled (for embeddings, extraction and chat).
+Requirements: Node.js 24 or later (the Docker image uses 24), PostgreSQL 15+ with the [pgvector](https://github.com/pgvector/pgvector) extension (0.8+), and a Google Cloud project with Vertex AI enabled (for embeddings, extraction and chat).
 
 ```sh
 npm install
