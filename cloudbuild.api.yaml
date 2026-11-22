@@ -9,6 +9,12 @@
 #   --substitutions=_TAG=v1.5.2,_REGION=europe-west1
 # _ALLOWED_ORIGINS takes one origin. For several, use gcloud's custom-delimiter
 # syntax in --set-env-vars (see `gcloud topic escaping`).
+#
+# Values that contain commas (_SECRETS) need a custom delimiter for --substitutions, e.g.
+#   --substitutions='^~^_TAG=abc123~_SECRETS=DATABASE_URL=my-db-url:latest,JWT_SECRET=my-jwt:latest'
+#
+# Settings not set here (Cloud SQL attachment, VPC egress, service account) are kept from the
+# service's current revision; set them once with `gcloud run services update` (docs/deployment-gcp.md).
 
 steps:
   # Build the container image
@@ -99,5 +105,5 @@ substitutions:
   # TRUSTED_RELAY_SECRETS: the secret(s) the Next.js server sends in X-Relay-Secret (§6). Create it before deploying.
   _SECRETS: DATABASE_URL=database-url:latest,JWT_SECRET=jwt-secret:latest,GEMINI_API_KEY=gemini-api-key:latest,GROQ_API_KEY=groq-api-key:latest,TRUSTED_RELAY_SECRETS=trusted-relay-secrets:latest
 
-options:
-  machineType: 'E2_HIGHCPU_8'
+# No options.machineType: the default build machine has a free monthly allowance, and this build
+# (npm ci + tsc, no browser) doesn't need a bigger one.

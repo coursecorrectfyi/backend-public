@@ -194,6 +194,35 @@ balancer, CDN, proxy) in front of the API, or moving the API off Cloud Run.** Th
 gcloud run services update cc-backend --add-cloudsql-instances=$SQL_CONNECTION --region=$REGION --project=$PROJECT_ID
 ```
 
+If the database runs on a VM in your VPC instead of Cloud SQL, attach the network once instead (the VM's private IP
+goes in `DATABASE_URL`):
+
+```sh
+gcloud run services update cc-backend --network=default --subnet=default --vpc-egress=private-ranges-only \
+  --region=$REGION --project=$PROJECT_ID
+```
+
+Deploys keep both settings: `gcloud run deploy` changes only the flags it's given.
+
+**Clean up old images.** Every deploy pushes a new image, and Artifact Registry bills storage above its free tier. A
+cleanup policy keeps the last 10 (enough to roll back) and deletes older ones:
+
+```sh
+cat > cleanup-policy.json <<'JSON'
+[
+  {"name": "keep-recent", "action": {"type": "Keep"}, "mostRecentVersions": {"keepCount": 10}},
+  {"name": "delete-old", "action": {"type": "Delete"}, "condition": {"tagState": "any", "olderThan": "30d"}}
+]
+JSON
+gcloud artifacts repositories set-cleanup-policies $AR_REPO --policy=cleanup-policy.json \
+  --location=$REGION --project=$PROJECT_ID --dry-run
+```
+
+With `--dry-run` the policy only logs what it would delete. Once that looks right, run the same command with
+`--no-dry-run`.
+
+Keep rules win over delete rules, so the 10 newest images stay whatever their age.
+
 ## 3. Batch jobs
 
 The jobs run from the same image as the API; the entry point is chosen per job with `--command` / `--args`.
