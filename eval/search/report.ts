@@ -187,7 +187,8 @@ function distancesByGrade(rows: QueryRow[], runs: Run[], grades: Grades): Distan
 
 const num = (v: number | null, digits = 2) => (v === null ? '–' : v.toFixed(digits))
 const ms = (v: number | null) => (v === null ? '–' : String(Math.round(v)))
-const esc = (s: string) => s.replace(/\|/g, '\\|')
+// Markdown table cell: escape backslashes first, then the pipes that would end the cell.
+const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|')
 
 function cell(m: RowMetrics): string {
   if (!m.ran) return 'not run'
